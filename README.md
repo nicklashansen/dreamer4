@@ -10,7 +10,7 @@ This PyTorch implementation is loosely based on [Edward Hu](https://github.com/e
 
 ![Demo](assets/0.gif)
 
-**Try it out!** We provide model checkpoints and a simple web interface for interaction with the world model. See the [Interactive Web Interface](#interactive-web-interface) section for details.
+**Try it out!** We provide model checkpoints and a simple web interface for interaction with the world model.
 
 ----
 
@@ -73,7 +73,9 @@ To train the Dreamer 4 dynamics model with action conditioning, run the followin
 torchrun --nproc_per_node=8 train_dynamics.py --use_actions
 ```
 
-This will start the training process using 8 GPUs. Note that this script assumes that you already have a trained tokenizer; if your tokenizer is located at a different path than the default `./logs/tokenizer_ckpts/latest.pt`, you can specify it using the `--tokenizer_ckpt` argument. You can expect training to take approximately 48 hours on 8× RTX 3090 GPUs.
+This will start the training process using 8 GPUs. Note that this script assumes that you already have a trained tokenizer; if your tokenizer is located at a different path than the default `./logs/tokenizer_ckpts/latest.pt`, you can specify it using the `--tokenizer_ckpt` argument. You can expect training to take approximately 48 hours on 8× RTX 3090 GPUs, after which you should see curves that look something like this:
+
+<img src="assets/dynamics/action_shuffle_ratio.png" width="33.33%"><img src="assets/dynamics/loss.png" width="33.33%"><img src="assets/dynamics/psnr.png" width="33.33%"></br>
 
 ----
 
@@ -81,7 +83,7 @@ This will start the training process using 8 GPUs. Note that this script assumes
 
 ![Web interface](assets/4.gif)
 
-We provide a simple web interface for interaction with the trained world model. The web serve runs locally on your machine and requires a CUDA-enabled GPU with at least 2 GB memory. Before starting the web server, verify that all paths in `interactive.py` point to valid directories and checkpoints. You can download our provided checkpoints from [HuggingFace](https://huggingface.co/nicklashansen/dreamer4/tree/main) or train your own. To start the web server, run the following command:
+We provide a simple web interface for interaction with the trained world model. The web server runs locally on your machine and requires a CUDA-enabled GPU with at least 2 GB memory. Before starting the web server, verify that all paths in `interactive.py` point to valid directories and checkpoints. You can download our provided checkpoints from [HuggingFace](https://huggingface.co/nicklashansen/dreamer4/tree/main) or train your own. To start the web server, run the following command:
 
 ```
 python interactive.py
