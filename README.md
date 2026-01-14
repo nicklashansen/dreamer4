@@ -20,7 +20,7 @@ Dreamer 4 consists of a causal tokenizer and an interactive dynamics model, whic
 
 <img src="assets/tasks/walker-run.gif" width="14.28%"><img src="assets/tasks/finger-spin.gif" width="14.28%"><img src="assets/tasks/hopper-hop.gif" width="14.28%"><img src="assets/tasks/jumper-jump.gif" width="14.28%"><img src="assets/tasks/walker-run-backward.gif" width="14.28%"><img src="assets/tasks/pendulum-swingup.gif" width="14.28%"><img src="assets/tasks/reacher-hard.gif" width="14.28%"></br>
 
-We will be using mixed-quality trajectory data spanning **30 continuous control tasks** from [DMControl](https://arxiv.org/abs/1801.00690) and [MMBench](https://arxiv.org/abs/2511.19584). The dataset contains 240 trajectories per task for a total of 7,200 trajectories (3.6M frames), and is collected using expert [TD-MPC2](https://www.tdmpc2.com) agents that were released as part of our [Newt/MMBench](https://www.nicklashansen.com/NewtWM) project. Our dataset will soon be made publicly available on [HuggingFace](https://huggingface.co/nicklashansen). In the meantime, refer to the [Newt repository](https://github.com/nicklashansen/newt) for information on how you can generate your own data; our data generation procedure is very similar but not identical to that of Newt.
+Our dataset contains 7,200 mixed-quality trajectories (3.6M frames) spanning **30 continuous control tasks** from [DMControl](https://arxiv.org/abs/1801.00690) and [MMBench](https://arxiv.org/abs/2511.19584). To construct the dataset, we collect 240 trajectories per task using expert [TD-MPC2](https://www.tdmpc2.com) agents that were released as part of our [Newt/MMBench](https://www.nicklashansen.com/NewtWM) project. We use a default resolution of 128×128 for training but the dataset supports up to 224×224. Our dataset will soon be made publicly available on [HuggingFace](https://huggingface.co/nicklashansen). In the meantime, refer to the [Newt repository](https://github.com/nicklashansen/newt) for information on how you can generate your own data; our data generation procedure is very similar but not identical to that of Newt (we add noise to actions to increase data diversity).
 
 In the following, we will walk you through training a **single** world model on **all 30 tasks**, as well as how to interact with it via a simple web interface.
 
@@ -41,7 +41,7 @@ This will install *most* of the required packages, however, this repository is s
 
 ## Training the Tokenizer
 
-![Tokenizer training](assets/2.png)
+![Tokenizer training](assets/1.png)
 
 To train the Dreamer 4 tokenizer, run the following command:
 
@@ -59,7 +59,7 @@ You can expect training to take approximately 24 hours on 8× RTX 3090 GPUs, aft
 
 ## Training the World Model
 
-![Dynamics training](assets/3.png)
+![Dynamics training](assets/2.png)
 
 To train the Dreamer 4 dynamics model with action conditioning, run the following command:
 
@@ -73,9 +73,9 @@ This will start the training process using 8 GPUs. Note that this script assumes
 
 ## Interactive Web Interface
 
-![Web interface](assets/4.png)
+![Web interface](assets/3.gif)
 
-We provide a simple web interface to interact with the trained world model. To start the web server, run the following command:
+We provide a simple web interface for interaction with the trained world model. To start the web server, verify that all paths in `interactive.py` point to valid directories and checkpoints, and then run the following command:
 
 ```
 python interactive.py
@@ -94,6 +94,37 @@ assuming the web server is running on `remote-machine` and you want to forward i
 ## Checkpoints
 
 Pre-trained tokenizer and dynamics model checkpoints will be made available soon.
+
+----
+
+## Citation
+
+If you use this codebase in your research, please consider citing us as:
+
+```
+@misc{Hansen2026Dreamer4PyTorch,
+    title={Dreamer 4 in PyTorch},
+    author={Nicklas Hansen},
+    year={2026},
+    publisher={GitHub},
+    journal={GitHub repository},
+    howpublished={\url{https://github.com/nicklashansen/dreamer4}},
+}
+```
+
+as well as the original Dreamer 4 paper:
+
+```
+@misc{Hafner2025TrainingAgents,
+    title={Training Agents Inside of Scalable World Models}, 
+    author={Danijar Hafner and Wilson Yan and Timothy Lillicrap},
+    year={2025},
+    eprint={2509.24527},
+    archivePrefix={arXiv},
+    primaryClass={cs.AI},
+    url={https://arxiv.org/abs/2509.24527}, 
+}
+```
 
 ----
 

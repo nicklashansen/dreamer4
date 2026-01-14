@@ -787,7 +787,7 @@ def main():
     p.add_argument("--shard_size", type=int, default=2048)
 
     # checkpoints
-    p.add_argument("--tokenizer_ckpt", type=str, default="./logs/tokenizer_ckpts/step_0040000.pt") #latest.pt")
+    p.add_argument("--tokenizer_ckpt", type=str, default="./logs/tokenizer_ckpts/latest.pt")
     p.add_argument("--dynamics_ckpt", type=str, default="./logs/dynamics_ckpts/latest.pt")
 
     # rollout
