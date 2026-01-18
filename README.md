@@ -26,9 +26,15 @@ Dreamer 4 consists of a causal tokenizer and an interactive dynamics model, whic
 
 <img src="assets/tasks/walker-run.gif" width="14.28%"><img src="assets/tasks/finger-spin.gif" width="14.28%"><img src="assets/tasks/hopper-hop.gif" width="14.28%"><img src="assets/tasks/jumper-jump.gif" width="14.28%"><img src="assets/tasks/walker-run-backward.gif" width="14.28%"><img src="assets/tasks/pendulum-swingup.gif" width="14.28%"><img src="assets/tasks/reacher-hard.gif" width="14.28%"></br>
 
-Our dataset contains 7,200 mixed-quality trajectories (3.6M frames) spanning **30 continuous control tasks** from [DMControl](https://arxiv.org/abs/1801.00690) and [MMBench](https://arxiv.org/abs/2511.19584). To construct the dataset, we collect 240 trajectories per task using expert [TD-MPC2](https://www.tdmpc2.com) agents that were released as part of our [Newt/MMBench](https://www.nicklashansen.com/NewtWM) project. We use a default resolution of 128×128 for training but the dataset supports up to 224×224. Our dataset will soon be made publicly available on [HuggingFace](https://huggingface.co/nicklashansen). In the meantime, refer to the [Newt repository](https://github.com/nicklashansen/newt) for information on how you can generate your own data; our data generation procedure is very similar but not identical to that of Newt (we add noise to actions to increase data diversity).
+Our dataset is available for download on [https://huggingface.co/datasets/nicklashansen/dreamer4](HuggingFace) and contains 7,200 mixed-quality trajectories (3.6M frames) spanning **30 continuous control tasks** from [DMControl](https://arxiv.org/abs/1801.00690) and [MMBench](https://arxiv.org/abs/2511.19584). To construct the dataset, we collect 240 trajectories per task using expert [TD-MPC2](https://www.tdmpc2.com) agents that were released as part of our [Newt/MMBench](https://www.nicklashansen.com/NewtWM) project. We use a default resolution of 128×128 for training but the dataset supports up to 224×224. We provide:
 
-In the following, we will walk you through training a **single** world model on **all 30 tasks**, as well as how to interact with it via a simple web interface.
+| Directory  |  Description  | Trajs. per task | Total trajs.
+|--------|---------------|------------|-------|
+| [expert](https://huggingface.co/datasets/nicklashansen/dreamer4/tree/main/expert) | Expert demos | 20 | 600 |
+| [mixed-small](https://huggingface.co/datasets/nicklashansen/dreamer4/tree/main/mixed-small) | Mixed quality |  20 | 600 |
+| [mixed-large](https://huggingface.co/datasets/nicklashansen/dreamer4/tree/main/mixed-large) | Mixed quality |  200 | 6000 |
+
+The data generation pipeline used to generate this dataset is similar to that of our [Newt repository](https://github.com/nicklashansen/newt), except in the case of `mixed-small` and `mixed-large` we add diverse noise patterns to actions to increase diversity of behaviors present in the data. Our released model checkpoints were trained on data from **all three directories**. In the following, we will walk you through data preprocessing, training a **single** world model on **all 30 tasks**, as well as how to interact with it via a simple web interface.
 
 ----
 
@@ -41,7 +47,19 @@ conda env create -f environment.yaml
 conda activate dreamer4
 ```
 
-This should install all required packages. Dataset and model checkpoints are (depending on your use case) optional and can downloaded separately.
+This should install all required packages. Dataset and model checkpoints are (depending on your use case) optional and can be downloaded separately. Our data is made available [here](https://huggingface.co/datasets/nicklashansen/dreamer4) and model checkpoints are available [here](https://huggingface.co/nicklashansen/dreamer4).
+
+----
+
+## Data preprocessing
+
+Our provided dataset needs to be preprocessed into a sharded data format to ensure efficient data loading during training. Please be aware that the full preprocessed dataset requires approximately **350 GB of disk storage**. To preprocess the data, run the following command:
+
+```
+python preprocess_data.py
+```
+
+This will preprocess data located in the `FILEDIR` directory (see code comments in `preprocess_data.py` for details) and save the preprocessed shards to the `OUTDIR` directory. You can change these paths by modifying the respective variables in `preprocess_data.py`. To reproduce the results presented in this repo, you will need to preprocess all three data directories provided. Pleases note that the preprocessing step may take several hours depending on your hardware. After preprocessing, you should see a number of shard files in the output directory; repeat this process for all three data directories (`expert`, `mixed-small`, `mixed-large`) to obtain the full dataset for training.
 
 ----
 
@@ -49,13 +67,23 @@ This should install all required packages. Dataset and model checkpoints are (de
 
 ![Tokenizer training](assets/2.png)
 
-To train the Dreamer 4 tokenizer, run the following command:
+To train the Dreamer 4 tokenizer, first set the ``--data-dirs`` argument in `train_tokenizer.py` to one or more preprocessed data directories, e.g.
+
+```
+p.add_argument("--data_dirs", type=str, nargs="+", default=[   # paths to preprocessed frames
+        "/<path>/expert-shards",
+        "/<path>/mixed-small-shards",
+        "/<path>/mixed-large-shards",
+    ])
+```
+
+and then run the following command:
 
 ```
 torchrun --nproc_per_node=8 train_tokenizer.py
 ```
 
-This will start the training process using 8 GPUs. The tokenizer checkpoints will be saved in the `./logs/tokenizer_ckpts/` directory by default. You can change this path using the `--ckpt_dir` argument.
+This will start the training process using 8 GPUs. The tokenizer checkpoints will be saved in the `./logs/tokenizer_ckpts/` directory by default; please check the script for a full list of configurable arguments.
 
 You can expect training to take approximately 24 hours on 8× RTX 3090 GPUs, after which you should see curves that look something like this:
 
@@ -67,7 +95,7 @@ You can expect training to take approximately 24 hours on 8× RTX 3090 GPUs, aft
 
 ![Dynamics training](assets/3.png)
 
-To train the Dreamer 4 dynamics model with action conditioning, run the following command:
+To train the Dreamer 4 dynamics model with action conditioning, first set the `--data-dirs` and `--frame_dirs` arguments in `train_dynamics.py` to one or more unprocessed and preprocessed data directories, respectively, and run the following command:
 
 ```
 torchrun --nproc_per_node=8 train_dynamics.py --use_actions

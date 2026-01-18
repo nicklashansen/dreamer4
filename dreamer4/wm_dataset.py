@@ -32,7 +32,7 @@ class WMDataset(Dataset):
         shard_size: int = 2048,
         cache_mb: int = 2048,
         verbose: bool = True,
-        tasks_json: str = "/data/nihansen/code/newt2/tasks.json",
+        tasks_json: str = "../tasks.json",
         tasks: Optional[list[str]] = None,
         strict_tasks: bool = True,
     ):

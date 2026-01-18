@@ -1,3 +1,4 @@
+# preprocess_dataset.py
 import os
 from pathlib import Path
 
@@ -8,11 +9,11 @@ import torch.nn.functional as F
 from task_set import TASK_SET
 
 
-FILEDIR = "/data/nihansen/data/newt/data-expl"       # sprite PNGs
-OUTDIR = "/data/nihansen/data/newt/frames128-expl"      # preprocessed shards
+FILEDIR = "/<path>/expert"        # raw data source
+OUTDIR = "/<path>/expert-shards"  # preprocessed shards
 
-TARGET_SIZE = 128
-SHARD_SIZE = 2048
+TARGET_SIZE = 128   # image resolution for training
+SHARD_SIZE = 2048   # number of frames per shard
 
 
 def safe_save_frames(frames: torch.Tensor, out_path: Path) -> bool:

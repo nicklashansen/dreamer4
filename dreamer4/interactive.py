@@ -781,13 +781,13 @@ def main():
     p.add_argument("--task", type=str, default="finger-turn-hard")
 
     # data
-    p.add_argument("--data_dir", type=str, default="/data/nihansen/data/newt/data")
-    p.add_argument("--frames_dir", type=str, default="/data/nihansen/data/newt/frames128")
-    p.add_argument("--tasks_json", type=str, default="/data/nihansen/code/newt2/tasks.json")
+    p.add_argument("--data_dir", type=str, default="/<path>/data")   # path to raw data
+    p.add_argument("--frames_dir", type=str, default="/<path>/frames128")   # path to processed frames
+    p.add_argument("--tasks_json", type=str, default="../tasks.json")   # task metadata
     p.add_argument("--shard_size", type=int, default=2048)
 
     # checkpoints
-    p.add_argument("--tokenizer_ckpt", type=str, default="./logs/tokenizer_ckpts/latest.pt")
+    p.add_argument("--tokenizer_ckpt", type=str, default="./logs/tokenizer_ckpts/step_0085000.pt")
     p.add_argument("--dynamics_ckpt", type=str, default="./logs/dynamics_ckpts/latest.pt")
 
     # rollout

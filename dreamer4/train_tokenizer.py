@@ -376,10 +376,10 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
 
     # data
-    p.add_argument("--data_dirs", type=str, nargs="+", default=[
-        "/data/nihansen/data/newt/frames128",
-        "/data/nihansen/data/newt/frames128-expl",
-        "/data/nihansen/data/newt/shards200",
+    p.add_argument("--data_dirs", type=str, nargs="+", default=[   # paths to preprocessed frames
+        "/<path>/expert-shards",
+        "/<path>/mixed-small-shards",
+        "/<path>/mixed-large-shards",
     ])
     p.add_argument("--seq_len", type=int, default=8)
     p.add_argument("--num_workers", type=int, default=8)

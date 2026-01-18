@@ -898,18 +898,18 @@ def train(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
 
-    # data
-    p.add_argument("--data_dirs", type=str, nargs="+", default=[
-        "/data/nihansen/data/newt/data",
-        "/data/nihansen/data/newt/data-expl",
-        "/data/nihansen/data/newt/data200",
+    # data (if using multiple datasets, make sure they align in order)
+    p.add_argument("--data_dirs", type=str, nargs="+", default=[   # paths to raw data
+        "/<path>/expert",
+        "/<path>/mixed-small",
+        "/<path>/mixed-large",
     ])
-    p.add_argument("--frame_dirs", type=str, nargs="+", default=[
-        "/data/nihansen/data/newt/frames128",
-        "/data/nihansen/data/newt/frames128-expl",
-        "/data/nihansen/data/newt/shards200",
+    p.add_argument("--frame_dirs", type=str, nargs="+", default=[  # paths to preprocessed frames
+        "/<path>/expert-shards",
+        "/<path>/mixed-small-shards",
+        "/<path>/mixed-large-shards",
     ])
-    p.add_argument("--tasks_json", type=str, default="../tasks.json")
+    p.add_argument("--tasks_json", type=str, default="../tasks.json")  # task metadata
     p.add_argument("--seq_len", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=24)
