@@ -258,6 +258,7 @@ def load_tokenizer_from_ckpt(tokenizer_ckpt: str, device: torch.device):
     dropout = float(a.get("dropout", 0.0))
     mlp_ratio = float(a.get("mlp_ratio", 4.0))
     time_every = int(a.get("time_every", 1))
+    scale_pos_embeds = bool(a.get("scale_pos_embeds", True))
 
     assert H % patch == 0 and W % patch == 0
     n_patches = (H // patch) * (W // patch)
@@ -276,6 +277,7 @@ def load_tokenizer_from_ckpt(tokenizer_ckpt: str, device: torch.device):
         time_every=time_every,
         mae_p_min=0.0,
         mae_p_max=0.0,
+        scale_pos_embeds=scale_pos_embeds,
     )
     dec = Decoder(
         d_bottleneck=d_bottleneck,
@@ -288,6 +290,7 @@ def load_tokenizer_from_ckpt(tokenizer_ckpt: str, device: torch.device):
         dropout=dropout,
         mlp_ratio=mlp_ratio,
         time_every=time_every,
+        scale_pos_embeds=scale_pos_embeds,
     )
     tok = Tokenizer(enc, dec).to(device)
     tok.load_state_dict(_get_state_dict(ckpt), strict=True)
@@ -320,6 +323,7 @@ def load_dynamics_from_ckpt(
     n_register = int(a.get("n_register", 4))
     n_agent = int(a.get("n_agent", 0))
     space_mode = str(a.get("space_mode", a.get("agent_space_mode", "wm_agent_isolated")))
+    scale_pos_embeds = bool(a.get("scale_pos_embeds", True))
 
     assert n_latents % packing_factor == 0
     n_spatial = n_latents // packing_factor
@@ -339,6 +343,7 @@ def load_dynamics_from_ckpt(
         mlp_ratio=mlp_ratio,
         time_every=time_every,
         space_mode=space_mode,
+        scale_pos_embeds=scale_pos_embeds,
     ).to(device)
     dyn.load_state_dict(_get_state_dict(ckpt), strict=True)
     dyn.eval()

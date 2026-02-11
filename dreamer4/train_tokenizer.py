@@ -134,6 +134,7 @@ def save_ckpt(path: Path, *, step: int, epoch: int, model, opt, scaler, args: ar
         "opt": opt.state_dict(),
         "scaler": scaler.state_dict() if scaler is not None else None,
         "args": vars(args),
+        "scale_pos_embeds": args.scale_pos_embeds,
     }
     tmp = path.with_suffix(".tmp")
     torch.save(obj, tmp)
@@ -198,6 +199,7 @@ def train(args):
         time_every=args.time_every,
         mae_p_min=args.mae_p_min,
         mae_p_max=args.mae_p_max,
+        scale_pos_embeds=args.scale_pos_embeds,
     )
     dec = Decoder(
         d_bottleneck=args.d_bottleneck,
@@ -210,6 +212,7 @@ def train(args):
         dropout=args.dropout,
         mlp_ratio=args.mlp_ratio,
         time_every=args.time_every,
+        scale_pos_embeds=args.scale_pos_embeds,
     )
     model = Tokenizer(enc, dec).to(device)
 
@@ -402,6 +405,10 @@ if __name__ == "__main__":
     p.add_argument("--time_every", type=int, default=1)
     p.add_argument("--mae_p_min", type=float, default=0.0)
     p.add_argument("--mae_p_max", type=float, default=0.9)
+
+    # Better performance without scale_pos_embeds (set to False)
+    # Set to True by default for backwards compatibility. Details here: https://github.com/nicklashansen/dreamer4/pull/4
+    p.add_argument("--scale_pos_embeds", action="store_true")
 
     # optim
     p.add_argument("--lr", type=float, default=1e-4)

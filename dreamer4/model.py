@@ -89,12 +89,16 @@ def sinusoid_table(n: int, d: int, base: float = 10000.0, device=None) -> torch.
     return torch.where((i % 2) == 0, torch.sin(ang), torch.cos(ang))  # (n,d) fp32
 
 
-def add_sinusoidal_positions(tokens_btSd: torch.Tensor) -> torch.Tensor:
+def add_sinusoidal_positions(tokens_btSd: torch.Tensor, scale_pos_embeds) -> torch.Tensor:
     B, T, S, D = tokens_btSd.shape
     device = tokens_btSd.device
     pos_t = sinusoid_table(T, D, device=device)  # fp32
     pos_s = sinusoid_table(S, D, device=device)  # fp32
-    pos = (pos_t[None, :, None, :] + pos_s[None, None, :, :])
+    if scale_pos_embeds:
+        pos = (pos_t[None, :, None, :] + pos_s[None, None, :, :]) * (1.0 / math.sqrt(D))
+    else:
+        pos = (pos_t[None, :, None, :] + pos_s[None, None, :, :])
+
     return tokens_btSd + pos.to(dtype=tokens_btSd.dtype)
 
 
@@ -368,11 +372,13 @@ class Encoder(nn.Module):
         latents_only_time: bool = True,
         mae_p_min: float = 0.0,
         mae_p_max: float = 0.9,
+        scale_pos_embeds: bool = True,
     ):
         super().__init__()
         self.d_model = d_model
         self.n_latents = n_latents
         self.n_patches = n_patches
+        self.scale_pos_embeds = scale_pos_embeds
 
         self.patch_proj = nn.Linear(patch_dim, d_model)
         self.bottleneck_proj = nn.Linear(d_model, d_bottleneck)
@@ -401,7 +407,7 @@ class Encoder(nn.Module):
 
         lat = self.latents.view(1, 1, self.n_latents, -1).expand(B, T, -1, -1)
         tokens = torch.cat([lat, proj_masked], dim=2)        # (B,T,S,D)
-        tokens = add_sinusoidal_positions(tokens)
+        tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds)
 
         enc = self.transformer(tokens)
         z = torch.tanh(self.bottleneck_proj(enc[:, :, :self.n_latents, :]))
@@ -423,10 +429,12 @@ class Decoder(nn.Module):
         mlp_ratio: float = 4.0,
         time_every: int = 4,
         latents_only_time: bool = True,
+        scale_pos_embeds: bool = True,
     ):
         super().__init__()
         self.n_latents = n_latents
         self.n_patches = n_patches
+        self.scale_pos_embeds = scale_pos_embeds
 
         self.up_proj = nn.Linear(d_bottleneck, d_model)
         self.patch_queries = nn.Parameter(torch.empty(n_patches, d_model))
@@ -452,7 +460,7 @@ class Decoder(nn.Module):
         lat = torch.tanh(self.up_proj(z_btLd))                                 # (B,T,L,D)
         qry = self.patch_queries.view(1, 1, self.n_patches, -1).expand(B, T, -1, -1)
         tokens = torch.cat([lat, qry], dim=2)                                  # (B,T,S,D)
-        tokens = add_sinusoidal_positions(tokens)
+        tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds)
 
         x = self.transformer(tokens)
         x_p = x[:, :, L:, :]
@@ -584,6 +592,7 @@ class Dynamics(nn.Module):
         mlp_ratio: float = 4.0,
         time_every: int = 4,
         space_mode: str = "wm_agent_isolated",  # or "wm_agent"
+        scale_pos_embeds: bool = True,
     ):
         super().__init__()
         assert d_spatial % d_bottleneck == 0, "expected packing: d_spatial = d_bottleneck * packing_factor"
@@ -593,6 +602,7 @@ class Dynamics(nn.Module):
         self.n_register = int(n_register)
         self.n_agent = int(n_agent)
         self.k_max = int(k_max)
+        self.scale_pos_embeds = scale_pos_embeds
 
         self.spatial_proj = nn.Linear(self.d_spatial, self.d_model)
         self.register_tokens = nn.Parameter(torch.empty(self.n_register, self.d_model))
@@ -672,7 +682,7 @@ class Dynamics(nn.Module):
             toks = [action_tokens, sig_tok, step_tok, spatial_tokens, reg]
 
         tokens = torch.cat(toks, dim=2)  # (B,T,S,D)
-        tokens = add_sinusoidal_positions(tokens)
+        tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds)
         x = self.transformer(tokens)
 
         spatial_out = x[:, :, self.spatial_slice, :]
