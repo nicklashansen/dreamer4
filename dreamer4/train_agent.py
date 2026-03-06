@@ -315,17 +315,18 @@ def train(args):
         n_tasks=128,
     ).to(device)
 
+    head_hidden = int(d_model * args.head_mlp_ratio)
     policy = PolicyHead(
         d_model=d_model,
         action_dim=args.action_dim,
+        hidden=head_hidden,
         mtp_length=args.mtp_length,
-        mlp_ratio=args.head_mlp_ratio,
     ).to(device)
 
     reward_head = RewardHead(
         d_model=d_model,
+        hidden=head_hidden,
         mtp_length=args.mtp_length,
-        mlp_ratio=args.head_mlp_ratio,
     ).to(device)
 
     if is_rank0():
