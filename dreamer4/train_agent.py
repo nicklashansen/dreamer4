@@ -264,7 +264,7 @@ def train(args):
         img_size=128,
         action_dim=16,
         tasks_json=args.tasks_json,
-        tasks=TASK_SET,
+        tasks=args.tasks if args.tasks else TASK_SET,
         verbose=is_rank0(),
     )
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
@@ -543,7 +543,7 @@ def train(args):
                         }, step=step)
 
                 # --- Checkpointing ---
-                if is_rank0() and args.save_every > 0 and (step % args.save_every == 0) and do_step:
+                if is_rank0() and args.save_every > 0 and step > 0 and (step % args.save_every == 0) and do_step:
                     save_ckpt(
                         ckpt_dir / f"step_{step:07d}.pt",
                         step=step, epoch=epoch,
@@ -588,6 +588,8 @@ if __name__ == "__main__":
     p.add_argument("--seq_len", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--tasks", type=str, nargs="+", default=None,
+                   help="Task subset. Default: all 30 TASK_SET tasks.")
 
     # Checkpoints
     p.add_argument("--tokenizer_ckpt", type=str, default="logs/tokenizer.pt")
