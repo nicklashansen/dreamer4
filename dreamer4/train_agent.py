@@ -37,7 +37,7 @@ from model import (
     Encoder, Decoder, Tokenizer, Dynamics, TaskEmbedder,
     temporal_patchify, pack_bottleneck_to_spatial,
 )
-from agent import PolicyHead, RewardHead
+from agent import PolicyHead, RewardHead, TanhNormal
 from train_dynamics import (
     get_dist_info, is_rank0, seed_everything, worker_init_fn,
     init_distributed, load_frozen_tokenizer_from_pt_ckpt,
@@ -193,8 +193,8 @@ def bc_loss(
         loss: scalar
         aux: dict
     """
-    mean, std = policy(h_t)  # (B, T, L, A), (B, T, L, A)
-    B, T, L, A = mean.shape
+    mu, std = policy(h_t)  # (B, T, L, A), (B, T, L, A) — mu is pre-tanh
+    B, T, L, A = mu.shape
 
     total_nll = torch.tensor(0.0, device=h_t.device)
     count = 0
@@ -204,12 +204,8 @@ def bc_loss(
             break
         # Actions at time t+l for input at time t
         target_actions = actions[:, l:l + valid_T, :A]  # (B, valid_T, A)
-        target_mask = act_mask[:, l:l + valid_T, :A]
 
-        d = torch.distributions.Independent(
-            torch.distributions.Normal(mean[:, :valid_T, l, :A], std[:, :valid_T, l, :A]), 1
-        )
-        # Mask out inactive action dims by only computing loss on active ones
+        d = TanhNormal(mu[:, :valid_T, l, :A], std[:, :valid_T, l, :A])
         nll = -d.log_prob(target_actions.clamp(-1, 1))  # (B, valid_T)
         total_nll = total_nll + nll.mean()
         count += 1

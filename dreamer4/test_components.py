@@ -83,11 +83,12 @@ def test_policy_head():
     head = PolicyHead(d_model=D, action_dim=ACTION_DIM, mtp_length=MTP_L).to(DEVICE)
     h_t = torch.randn(B, T, D, device=DEVICE)
 
-    mean, std = head(h_t)
-    check("mean shape", mean.shape == (B, T, MTP_L, ACTION_DIM), f"got {mean.shape}")
+    mu, std = head(h_t)  # mu is pre-tanh (unbounded), std > 0
+    check("mu shape", mu.shape == (B, T, MTP_L, ACTION_DIM), f"got {mu.shape}")
     check("std shape", std.shape == (B, T, MTP_L, ACTION_DIM), f"got {std.shape}")
-    check("mean in [-1,1]", (mean.abs() <= 1.0 + 1e-6).all().item(),
-          f"max={mean.abs().max().item():.4f}")
+    check("mu finite", mu.isfinite().all().item(), f"max={mu.abs().max().item():.4f}")
+    check("tanh(mu) in [-1,1]", (mu.tanh().abs() <= 1.0 + 1e-6).all().item(),
+          f"max={mu.tanh().abs().max().item():.4f}")
     check("std > 0", (std > 0).all().item(), f"min={std.min().item():.6f}")
 
     actions = head.sample(h_t, step=0)

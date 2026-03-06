@@ -89,7 +89,12 @@ def smooth(y, window=3):
     if len(y) <= window:
         return y
     kernel = np.ones(window) / window
-    return np.convolve(y, kernel, mode="same")
+    # "valid" avoids edge artifacts but shortens the array
+    smoothed = np.convolve(y, kernel, mode="valid")
+    # pad start/end with original values to keep length
+    pad_left = (window - 1) // 2
+    pad_right = window - 1 - pad_left
+    return np.concatenate([y[:pad_left], smoothed, y[len(y) - pad_right:]]) if pad_right > 0 else np.concatenate([y[:pad_left], smoothed])
 
 
 def smooth_x(x, window=3):

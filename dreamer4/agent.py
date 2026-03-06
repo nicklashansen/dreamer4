@@ -134,11 +134,71 @@ class HeadMLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Policy Head — truncated Normal for continuous actions in [-1, 1]
+# TanhNormal distribution — SAC-style squashed Gaussian for [-1, 1] actions
+# ---------------------------------------------------------------------------
+
+class TanhNormal:
+    """Normal distribution followed by tanh squashing.
+
+    Samples: x ~ Normal(mu, sigma), a = tanh(x)
+    Log prob: log p(a) = log N(x; mu, sigma) - sum(log(1 - tanh(x)^2))
+
+    This gives a proper density over [-1, 1] with correct Jacobian correction.
+    """
+
+    def __init__(self, mu: torch.Tensor, sigma: torch.Tensor):
+        """
+        Args:
+            mu: (..., action_dim) pre-tanh mean
+            sigma: (..., action_dim) std in pre-tanh space
+        """
+        self.mu = mu
+        self.sigma = sigma
+        self._normal = Independent(Normal(mu, sigma), 1)
+
+    def rsample(self) -> torch.Tensor:
+        """Differentiable sample in [-1, 1]."""
+        x = self._normal.rsample()
+        return torch.tanh(x)
+
+    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+        """Log prob of actions in [-1, 1] with Jacobian correction.
+
+        Args:
+            actions: (..., action_dim) in [-1, 1]
+
+        Returns:
+            (...) log probabilities
+        """
+        # Inverse tanh to get pre-tanh value
+        # Clamp to avoid atanh(±1) = ±inf
+        actions_clamped = actions.clamp(-0.999, 0.999)
+        x = torch.atanh(actions_clamped)
+
+        # Normal log prob in pre-tanh space
+        log_p = self._normal.log_prob(x)
+
+        # Jacobian correction: -sum(log(1 - tanh(x)^2))
+        # = -sum(log(1 - a^2)) since a = tanh(x)
+        log_p = log_p - torch.log(1 - actions_clamped.pow(2) + 1e-6).sum(dim=-1)
+
+        return log_p
+
+    @property
+    def mean(self) -> torch.Tensor:
+        """Deterministic action (tanh of the mean)."""
+        return torch.tanh(self.mu)
+
+
+# ---------------------------------------------------------------------------
+# Policy Head — TanhNormal for continuous actions in [-1, 1]
 # ---------------------------------------------------------------------------
 
 class PolicyHead(nn.Module):
     """Predicts continuous actions from agent token outputs.
+
+    Uses TanhNormal: MLP outputs pre-tanh mean + std, sampling applies tanh,
+    log_prob includes the Jacobian correction for proper density over [-1, 1].
 
     Multi-token prediction: from h_t, predicts actions for t+1 .. t+L.
     During inference, only the first prediction (t+1) is used.
@@ -170,52 +230,49 @@ class PolicyHead(nn.Module):
             h_t: (B, T, d_model) — agent token outputs (squeezed from n_agent=1)
 
         Returns:
-            mean: (B, T, L, action_dim)
-            std:  (B, T, L, action_dim)
+            mu:  (B, T, L, action_dim) — pre-tanh mean
+            std: (B, T, L, action_dim) — std in pre-tanh space
         """
         B, T, D = h_t.shape
         raw = self.mlp(h_t)  # (B, T, L*A*2)
         raw = raw.view(B, T, self.mtp_length, self.action_dim, 2)
-        mean_raw = raw[..., 0]  # (B, T, L, A)
+        mu = raw[..., 0]   # (B, T, L, A) — pre-tanh, unbounded
         std_raw = raw[..., 1]
 
-        mean = torch.tanh(mean_raw)
         std = F.softplus(std_raw + math.log(math.exp(self._init_std - self.min_std) - 1.0)) + self.min_std
 
-        return mean, std
+        return mu, std
 
-    def dist(self, h_t: torch.Tensor, step: int = 0) -> Independent:
-        """Get action distribution for a specific MTP step.
+    def dist(self, h_t: torch.Tensor, step: int = 0) -> TanhNormal:
+        """Get TanhNormal action distribution for a specific MTP step.
 
         Args:
             h_t: (B, T, d_model)
             step: which MTP step (0 = next action)
 
         Returns:
-            Independent Normal distribution over actions, shape (B, T)
+            TanhNormal distribution, event shape (action_dim,), batch shape (B, T)
         """
-        mean, std = self.forward(h_t)
-        return Independent(Normal(mean[:, :, step], std[:, :, step]), 1)
+        mu, std = self.forward(h_t)
+        return TanhNormal(mu[:, :, step], std[:, :, step])
 
     def sample(self, h_t: torch.Tensor, step: int = 0) -> torch.Tensor:
-        """Sample actions, clamped to [-1, 1].
+        """Sample actions in [-1, 1].
 
         Returns: (B, T, action_dim)
         """
-        d = self.dist(h_t, step)
-        return d.rsample().clamp(-1, 1)
+        return self.dist(h_t, step).rsample()
 
     def log_prob(self, h_t: torch.Tensor, actions: torch.Tensor, step: int = 0) -> torch.Tensor:
-        """Log prob of actions under the policy.
+        """Log prob of actions under the TanhNormal policy.
 
         Args:
             h_t: (B, T, d_model)
-            actions: (B, T, action_dim)
+            actions: (B, T, action_dim) in [-1, 1]
 
         Returns: (B, T)
         """
-        d = self.dist(h_t, step)
-        return d.log_prob(actions)
+        return self.dist(h_t, step).log_prob(actions)
 
 
 # ---------------------------------------------------------------------------
