@@ -79,16 +79,17 @@ def test_twohot_dist():
 
 
 def test_policy_head():
-    print("\n--- PolicyHead (discretized) ---")
-    NUM_BINS = 32
-    head = PolicyHead(d_model=D, action_dim=ACTION_DIM, mtp_length=MTP_L,
-                      num_bins=NUM_BINS).to(DEVICE)
+    print("\n--- PolicyHead ---")
+    head = PolicyHead(d_model=D, action_dim=ACTION_DIM, mtp_length=MTP_L).to(DEVICE)
     h_t = torch.randn(B, T, D, device=DEVICE)
 
-    logits = head(h_t)
-    check("logits shape", logits.shape == (B, T, MTP_L, ACTION_DIM, NUM_BINS),
-          f"got {logits.shape}")
-    check("logits finite", logits.isfinite().all().item())
+    mu, std = head(h_t)  # mu is pre-tanh (unbounded), std > 0
+    check("mu shape", mu.shape == (B, T, MTP_L, ACTION_DIM), f"got {mu.shape}")
+    check("std shape", std.shape == (B, T, MTP_L, ACTION_DIM), f"got {std.shape}")
+    check("mu finite", mu.isfinite().all().item(), f"max={mu.abs().max().item():.4f}")
+    check("tanh(mu) in [-1,1]", (mu.tanh().abs() <= 1.0 + 1e-6).all().item(),
+          f"max={mu.tanh().abs().max().item():.4f}")
+    check("std > 0", (std > 0).all().item(), f"min={std.min().item():.6f}")
 
     actions = head.sample(h_t, step=0)
     check("sample shape", actions.shape == (B, T, ACTION_DIM), f"got {actions.shape}")
@@ -97,25 +98,12 @@ def test_policy_head():
     lp = head.log_prob(h_t, actions, step=0)
     check("log_prob shape", lp.shape == (B, T), f"got {lp.shape}")
     check("log_prob finite", lp.isfinite().all().item())
-    check("log_prob ≤ 0", (lp <= 1e-6).all().item(),
-          f"max={lp.max().item():.4f}")
 
-    # gradient flow (log_prob is differentiable through logits)
+    # gradient flow
     loss = -lp.mean()
     loss.backward()
     has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in head.parameters())
     check("gradient flows", has_grad)
-
-    # two-hot BC loss
-    head.zero_grad()
-    dist = head.dist(h_t, step=0)
-    target_actions = torch.rand(B, T, ACTION_DIM, device=DEVICE) * 2 - 1  # [-1, 1]
-    bc_nll = dist.two_hot_loss(target_actions)  # (B, T, A)
-    check("two_hot_loss shape", bc_nll.shape == (B, T, ACTION_DIM), f"got {bc_nll.shape}")
-    check("two_hot_loss ≥ 0", (bc_nll >= -1e-6).all().item())
-    bc_nll.mean().backward()
-    has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in head.parameters())
-    check("two_hot_loss gradient flows", has_grad)
 
 
 def test_reward_head():
@@ -201,19 +189,19 @@ def test_pmpo_loss():
     loss_no_prior = pmpo_loss(log_probs2, advantages, None, alpha=0.5, beta=0.3)
     check("loss without prior finite", loss_no_prior.isfinite().item())
 
-    # all-positive advantages → everything in D+, D- empty
-    log_probs3 = -torch.rand(N, device=DEVICE, requires_grad=True)  # categorical: ≤ 0
+    # all-positive advantages should NOT cause explosion (advantage normalization)
+    log_probs3 = torch.randn(N, device=DEVICE, requires_grad=True)
     all_pos_adv = torch.ones(N, device=DEVICE) * 10.0
     loss_all_pos = pmpo_loss(log_probs3, all_pos_adv, None, alpha=0.5, beta=0.3)
     check("all-positive advantages finite", loss_all_pos.isfinite().item(),
           f"loss={loss_all_pos.item():.4f}")
 
-    # with action_dim normalization (categorical log_probs are ≤ 0)
-    log_probs4 = -torch.rand(N, device=DEVICE, requires_grad=True) * 3.0  # negative log_probs
-    loss_cat = pmpo_loss(log_probs4, advantages, log_probs_prior,
-                          alpha=0.5, beta=0.3, action_dim=6)
-    check("categorical action loss finite", loss_cat.isfinite().item(),
-          f"loss={loss_cat.item():.4f}")
+    # with action_dim normalization + entropy
+    log_probs4 = torch.randn(N, device=DEVICE, requires_grad=True) + 5.0  # high log_probs (continuous)
+    loss_cont = pmpo_loss(log_probs4, advantages, log_probs_prior,
+                          alpha=0.5, beta=0.3, action_dim=6, entropy_coef=3e-4)
+    check("continuous action loss finite", loss_cont.isfinite().item(),
+          f"loss={loss_cont.item():.4f}")
 
 
 def test_dynamics_integration():

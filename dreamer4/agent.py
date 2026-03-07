@@ -217,132 +217,17 @@ class TanhNormal:
 
 
 # ---------------------------------------------------------------------------
-# Per-dimension categorical action distribution (discretized [-1, 1])
-# ---------------------------------------------------------------------------
-
-class ActionDist:
-    """Independent categorical distributions per action dimension.
-
-    Each action dimension is discretized into num_bins uniform bins in [-1, 1].
-    log_softmax ∈ (-∞, 0] — naturally bounded, making PMPO stable.
-    """
-
-    def __init__(self, logits: torch.Tensor, num_bins: int = 32):
-        """
-        Args:
-            logits: (..., action_dim, num_bins)
-            num_bins: number of discrete bins per dimension
-        """
-        self.logits = logits
-        self.num_bins = num_bins
-        self.bins = torch.linspace(-1.0, 1.0, num_bins,
-                                   device=logits.device, dtype=torch.float32)
-
-    def sample(self) -> torch.Tensor:
-        """Sample discrete actions, return continuous values in [-1, 1].
-
-        Returns: (..., action_dim)
-        """
-        probs = F.softmax(self.logits.float(), dim=-1)
-        flat = probs.reshape(-1, self.num_bins)
-        idx_flat = torch.multinomial(flat, 1).squeeze(-1)
-        indices = idx_flat.view(self.logits.shape[:-1])
-        return self.bins[indices]
-
-    def sample_with_log_prob(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample and compute log_prob together. Avoids bin-lookup ambiguity.
-
-        Returns:
-            actions: (..., action_dim) continuous values in [-1, 1]
-            log_prob: (...) summed over action dims
-        """
-        log_probs_all = F.log_softmax(self.logits.float(), dim=-1)
-        probs = log_probs_all.exp()
-        flat = probs.reshape(-1, self.num_bins)
-        idx_flat = torch.multinomial(flat, 1).squeeze(-1)
-        indices = idx_flat.view(self.logits.shape[:-1])  # (..., action_dim)
-
-        actions = self.bins[indices]
-        lp_per_dim = log_probs_all.gather(-1, indices.unsqueeze(-1)).squeeze(-1)
-        return actions, lp_per_dim.sum(dim=-1)
-
-    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
-        """Log prob of continuous actions (snapped to nearest bin), summed over dims.
-
-        Args:
-            actions: (..., action_dim) in [-1, 1]
-
-        Returns: (...) log probabilities
-        """
-        return self.log_prob_per_dim(actions).sum(dim=-1)
-
-    def log_prob_per_dim(self, actions: torch.Tensor) -> torch.Tensor:
-        """Per-dimension log prob (nearest-bin lookup).
-
-        Args:
-            actions: (..., action_dim) in [-1, 1]
-
-        Returns: (..., action_dim)
-        """
-        indices = self._to_indices(actions)
-        log_probs = F.log_softmax(self.logits.float(), dim=-1)
-        return log_probs.gather(-1, indices.unsqueeze(-1)).squeeze(-1)
-
-    def two_hot_loss(self, targets: torch.Tensor) -> torch.Tensor:
-        """Two-hot cross-entropy loss per dimension (for BC supervision).
-
-        Interpolates between adjacent bins for smoother gradients than
-        snapping to the nearest bin.
-
-        Args:
-            targets: (..., action_dim) in [-1, 1]
-
-        Returns: (..., action_dim) per-dim NLL
-        """
-        # Map targets to continuous bin index in [0, num_bins - 1]
-        idx_f = (targets.clamp(-1, 1) + 1.0) / 2.0 * (self.num_bins - 1)
-        lo = idx_f.floor().long().clamp(0, self.num_bins - 2)
-        hi = lo + 1
-        w_hi = idx_f - lo.float()
-        w_lo = 1.0 - w_hi
-
-        log_probs = F.log_softmax(self.logits.float(), dim=-1)
-        lp_lo = log_probs.gather(-1, lo.unsqueeze(-1)).squeeze(-1)
-        lp_hi = log_probs.gather(-1, hi.unsqueeze(-1)).squeeze(-1)
-        # NLL = -log(w_lo * p_lo + w_hi * p_hi)
-        mixed = w_lo * lp_lo.exp() + w_hi * lp_hi.exp()
-        return -(mixed + 1e-8).log()
-
-    def _to_indices(self, actions: torch.Tensor) -> torch.Tensor:
-        """Map continuous [-1, 1] actions to nearest bin index."""
-        normalized = (actions.clamp(-1, 1) + 1.0) / 2.0  # [0, 1]
-        return (normalized * (self.num_bins - 1)).round().long().clamp(0, self.num_bins - 1)
-
-    @property
-    def entropy(self) -> torch.Tensor:
-        """Entropy per dimension summed, (...). Bounded in [0, log(num_bins)]."""
-        p = F.softmax(self.logits.float(), dim=-1)
-        lp = F.log_softmax(self.logits.float(), dim=-1)
-        return -(p * lp).sum(dim=-1).sum(dim=-1)  # sum over bins, then action_dim
-
-    @property
-    def mean(self) -> torch.Tensor:
-        """Expected action value per dim. (..., action_dim)."""
-        p = F.softmax(self.logits.float(), dim=-1)
-        return (p * self.bins).sum(dim=-1)
-
-
-# ---------------------------------------------------------------------------
-# Policy Head — Discretized actions (per-dim categorical over [-1, 1] bins)
+# Policy Head — TanhNormal for continuous actions in [-1, 1]
 # ---------------------------------------------------------------------------
 
 class PolicyHead(nn.Module):
-    """Predicts discrete-binned actions from agent token outputs.
+    """Predicts continuous actions from agent token outputs.
 
-    Each action dimension is independently categorized into num_bins uniform
-    bins in [-1, 1]. This makes PMPO stable (log_softmax ∈ (-∞, 0]).
+    Uses TanhNormal: MLP outputs pre-tanh mean + std, sampling applies tanh,
+    log_prob includes the Jacobian correction for proper density over [-1, 1].
 
     Multi-token prediction: from h_t, predicts actions for t+1 .. t+L.
+    During inference, only the first prediction (t+1) is used.
     """
 
     def __init__(
@@ -352,51 +237,72 @@ class PolicyHead(nn.Module):
         hidden: int = 512,
         mlp_depth: int = 2,
         mtp_length: int = 8,
-        num_bins: int = 32,
+        log_std_min: float = -5.0,
+        log_std_max: float = 2.0,
     ):
         super().__init__()
         self.action_dim = int(action_dim)
         self.mtp_length = int(mtp_length)
-        self.num_bins = int(num_bins)
+        self.log_std_min = float(log_std_min)
+        self.log_std_max = float(log_std_max)
 
-        out_dim = mtp_length * action_dim * num_bins
+        # One MLP outputs mean + raw_std for all L future steps
+        out_dim = mtp_length * action_dim * 2  # mean and raw_std
         self.mlp = HeadMLP(d_model, out_dim, hidden, mlp_depth)
 
-    def forward(self, h_t: torch.Tensor) -> torch.Tensor:
+    def forward(self, h_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            h_t: (B, T, d_model)
+            h_t: (B, T, d_model) — agent token outputs (squeezed from n_agent=1)
 
         Returns:
-            logits: (B, T, L, action_dim, num_bins)
+            mu:  (B, T, L, action_dim) — pre-tanh mean
+            std: (B, T, L, action_dim) — std in pre-tanh space
         """
         B, T, D = h_t.shape
-        raw = self.mlp(h_t)  # (B, T, L*A*num_bins)
-        return raw.view(B, T, self.mtp_length, self.action_dim, self.num_bins)
+        raw = self.mlp(h_t)  # (B, T, L*A*2)
+        raw = raw.view(B, T, self.mtp_length, self.action_dim, 2)
+        mu = raw[..., 0]   # (B, T, L, A) — pre-tanh, unbounded
+        std_raw = raw[..., 1]
 
-    def dist(self, h_t: torch.Tensor, step: Optional[int] = None) -> ActionDist:
-        """Get action distribution.
+        # Bounded log_std via tanh (TD-MPC2 style)
+        # log_std ∈ [log_std_min, log_std_max] → std ∈ [exp(min), exp(max)]
+        # With defaults: std ∈ [0.0067, 7.389]
+        log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (torch.tanh(std_raw) + 1)
+        std = torch.exp(log_std)
+
+        return mu, std
+
+    def dist(self, h_t: torch.Tensor, step: Optional[int] = None) -> TanhNormal:
+        """Get TanhNormal action distribution.
 
         Args:
             h_t: (B, T, d_model)
-            step: if given, return dist for that MTP step only;
-                  if None, return dist for all L steps
+            step: if given, return dist for that MTP step only (batch shape (B, T));
+                  if None, return dist for all L steps (batch shape (B, T, L))
 
         Returns:
-            ActionDist with per-dim categoricals
+            TanhNormal distribution with event shape (action_dim,)
         """
-        logits = self.forward(h_t)  # (B, T, L, A, num_bins)
+        mu, std = self.forward(h_t)  # (B, T, L, A)
         if step is not None:
-            return ActionDist(logits[:, :, step], self.num_bins)
-        return ActionDist(logits, self.num_bins)
+            return TanhNormal(mu[:, :, step], std[:, :, step])
+        return TanhNormal(mu, std)
 
     def sample(self, h_t: torch.Tensor, step: Optional[int] = None) -> torch.Tensor:
-        """Sample actions in [-1, 1] (bin centers)."""
-        return self.dist(h_t, step).sample()
+        """Sample actions in [-1, 1].
+
+        Returns: (B, T, action_dim) if step given, else (B, T, L, action_dim)
+        """
+        return self.dist(h_t, step).rsample()
 
     def log_prob(self, h_t: torch.Tensor, actions: torch.Tensor,
                  step: Optional[int] = None) -> torch.Tensor:
-        """Log prob of actions (nearest-bin), summed over dims.
+        """Log prob of actions under the TanhNormal policy.
+
+        Args:
+            h_t: (B, T, d_model)
+            actions: (B, T, action_dim) if step given, else (B, T, L, action_dim)
 
         Returns: (B, T) if step given, else (B, T, L)
         """
@@ -605,57 +511,55 @@ def pmpo_loss(
     alpha: float = 0.5,
     beta: float = 0.3,
     action_dim: int = 1,
-    entropy_coef: float = 0.0,
+    entropy_coef: float = 3e-4,
 ) -> torch.Tensor:
-    """PMPO policy loss (Eq. 11 from Dreamer 4 paper).
+    """Policy loss with advantage-weighted policy gradient + KL + entropy.
 
-    Sign-split formulation:
-      D+ = {i : A_i > 0}  →  maximize log π(a_i|s_i)   (push toward good actions)
-      D- = {i : A_i ≤ 0}  →  minimize log π(a_i|s_i)   (push away from bad actions)
+    L = -mean(normalize(A) * log π / action_dim)   [advantage-weighted PG]
+        + entropy_coef * mean(log π / action_dim)   [entropy regularization]
+        + β * mean(log π - log π_prior) / action_dim [KL to behavioral prior]
 
-    With discretized actions, log π = log_softmax ∈ (-∞, 0], so:
-      - D+ maximizes toward 0 (bounded above) — stable
-      - D- minimizes toward -∞ (probability → 0) — stable
-
-    L_policy = -α * mean(log π[D+]) - (1-α) * mean(log π[D-])
-    L_kl     = β * mean(log π - log π_prior)
+    Advantages are normalized to zero mean / unit std. When advantages have
+    near-zero variance (all similar), they are zeroed out → no gradient.
 
     Args:
-        log_probs: (N,) log π(a|s) — must be from categorical (bounded above by 0)
+        log_probs: (N,) log π(a|s) under current policy
         advantages: (N,) advantage estimates A_s = R^λ_s - v_s
-        log_probs_prior: (N,) log π_prior(a|s) under frozen behavioral prior
-        alpha: weight for D+ vs D- (0.5 = equal weight)
+        log_probs_prior: (N,) log π_prior(a|s) under frozen behavioral prior, or None
+        alpha: unused (kept for API compatibility)
         beta: KL regularization coefficient
-        action_dim: number of action dimensions (for normalizing log_probs)
-        entropy_coef: unused (kept for API compatibility)
+        action_dim: number of action dimensions (for normalizing continuous log_probs)
+        entropy_coef: coefficient for entropy regularization (prevents std collapse)
 
     Returns:
         scalar loss
     """
+    # Normalize log_probs by action_dim for scale-invariance
     lp = log_probs / max(action_dim, 1)
-    adv = advantages.detach()
 
-    pos = adv > 0
-    neg = ~pos
-
-    # D+: maximize log_prob for positive advantages → loss = -mean(lp[pos])
-    if pos.any():
-        loss_pos = -lp[pos].mean()
+    # Normalize advantages to zero mean / unit std.
+    adv_std = advantages.std()
+    if adv_std > 1e-8:
+        advantages = (advantages - advantages.mean()) / adv_std
     else:
-        loss_pos = torch.tensor(0.0, device=log_probs.device)
+        # No meaningful advantage signal — zero out to prevent runaway
+        advantages = torch.zeros_like(advantages)
 
-    # D-: minimize log_prob for negative advantages → loss = mean(lp[neg])
-    if neg.any():
-        loss_neg = lp[neg].mean()
-    else:
-        loss_neg = torch.tensor(0.0, device=log_probs.device)
+    # Advantage-weighted policy gradient.
+    # More robust than sign-split for continuous actions: when all advantages
+    # are similar, normalized advantages → 0 → no gradient (correct behavior).
+    # When there's real signal, positive advantages push log_prob up,
+    # negative push down, proportional to magnitude.
+    policy_loss = -(advantages.detach() * lp).mean()
 
-    policy_loss = alpha * loss_pos + (1.0 - alpha) * loss_neg
+    # Entropy regularization: minimize mean(lp) ≈ maximize entropy.
+    # Prevents std collapse for continuous actions.
+    entropy_loss = entropy_coef * lp.mean()
 
-    # KL to behavioral prior
+    # KL to behavioral prior (also normalized by action_dim)
     kl_loss = torch.tensor(0.0, device=log_probs.device)
     if log_probs_prior is not None and beta > 0:
         lp_prior = log_probs_prior / max(action_dim, 1)
         kl_loss = (lp - lp_prior).mean()
 
-    return policy_loss + beta * kl_loss
+    return policy_loss + entropy_loss + beta * kl_loss

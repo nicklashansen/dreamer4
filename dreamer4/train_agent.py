@@ -37,7 +37,7 @@ from model import (
     Encoder, Decoder, Tokenizer, Dynamics, TaskEmbedder,
     temporal_patchify, pack_bottleneck_to_spatial,
 )
-from agent import PolicyHead, RewardHead, ActionDist
+from agent import PolicyHead, RewardHead, TanhNormal
 from train_dynamics import (
     get_dist_info, is_rank0, seed_everything, worker_init_fn,
     init_distributed, load_frozen_tokenizer_from_pt_ckpt,
@@ -184,14 +184,14 @@ def bc_loss(
     action_dim: int,
     mtp_length: int,
 ) -> tuple:
-    """Behavioral cloning loss: masked two-hot cross-entropy for discretized actions.
+    """Behavioral cloning loss: masked NLL of dataset actions under the policy.
 
     MTP: for step l, predict action at t+l+1 from h_t at time t.
-    Per-dim NLL is masked so padding dimensions don't contribute.
+    Per-dim log probs are masked so padding dimensions don't contribute.
 
     Args:
         h_t: (B, T, d_model)
-        actions: (B, T, 16) — dataset actions in [-1, 1]
+        actions: (B, T, 16) — dataset actions
         act_mask: (B, T, 16) — 1.0 for valid dims, 0.0 for padding
         action_dim: effective action dimensions for current batch
         mtp_length: multi-token prediction length
@@ -200,8 +200,8 @@ def bc_loss(
         loss: scalar
         aux: dict
     """
-    logits = policy(h_t)  # (B, T, L, A, num_bins)
-    B, T, L, A, _ = logits.shape
+    mu, std = policy(h_t)  # (B, T, L, A)
+    B, T, L, A = mu.shape
 
     total_nll = torch.tensor(0.0, device=h_t.device)
     count = 0
@@ -212,17 +212,18 @@ def bc_loss(
         target = actions[:, l:l + valid_T, :A].clamp(-1, 1)
         mask_l = act_mask[:, l:l + valid_T, :A]  # (B, valid_T, A)
 
-        dist_l = ActionDist(logits[:, :valid_T, l], policy.num_bins)
-        # Per-dim two-hot NLL, masked for padding dims
-        per_dim_nll = dist_l.two_hot_loss(target)  # (B, valid_T, A)
-        masked_nll = per_dim_nll * mask_l
-        nll = masked_nll.sum(dim=-1) / mask_l.sum(dim=-1).clamp(min=1)
+        dist_l = TanhNormal(mu[:, :valid_T, l, :A], std[:, :valid_T, l, :A])
+        # Per-dim log prob, masked so padding dims don't contribute
+        per_dim = dist_l.log_prob_per_dim(target)  # (B, valid_T, A)
+        masked = per_dim * mask_l
+        nll = -masked.sum(dim=-1) / mask_l.sum(dim=-1).clamp(min=1)
         total_nll = total_nll + nll.mean()
         count += 1
 
     loss = total_nll / max(count, 1)
     aux = {
         "bc_nll": loss.detach(),
+        "bc_mean_std": std.mean().detach(),
     }
     return loss, aux
 

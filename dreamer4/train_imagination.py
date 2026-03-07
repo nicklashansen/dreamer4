@@ -264,8 +264,8 @@ def imagine_rollout(
         # Sample action from policy (differentiable through policy params)
         with autocast(device_type="cuda", enabled=use_amp):
             dist = policy.dist(h_detached.unsqueeze(1), step=0)  # over (B, 1)
-            action_raw, lp_raw = dist.sample_with_log_prob()  # (B, 1, A), (B, 1)
-            action = action_raw[:, 0]  # (B, action_dim) — already in [-1, 1]
+            action_raw, lp_raw = dist.rsample_with_log_prob()  # (B, 1, A), (B, 1)
+            action = action_raw[:, 0].clamp(-1, 1)  # (B, action_dim)
             lp = lp_raw[:, 0]  # (B,)
 
         h_states.append(h_detached)

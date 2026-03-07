@@ -269,10 +269,9 @@ def main():
         print(f"    mean: {samples.mean(0).squeeze()}")
         print(f"    std:  {samples.std(0).squeeze()}")
 
-        logits = policy(h_o[:, 4:5])
-        dist = policy.dist(h_o[:, 4:5], step=0)
-        print(f"  Policy mean (expected): {dist.mean[0, 0].cpu().tolist()}")
-        print(f"  Policy entropy: {dist.entropy[0, 0].item():.4f}")
+        mu, std = policy(h_o[:, 4:5])
+        print(f"  Policy mu (pre-tanh): {mu[0, 0, 0].cpu().tolist()}")
+        print(f"  Policy std: {std[0, 0, 0].cpu().tolist()}")
 
     # ===================================================================
     # TEST 5: Dynamics x1_hat sensitivity (before denoising integration)
