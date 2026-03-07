@@ -189,6 +189,20 @@ def test_pmpo_loss():
     loss_no_prior = pmpo_loss(log_probs2, advantages, None, alpha=0.5, beta=0.3)
     check("loss without prior finite", loss_no_prior.isfinite().item())
 
+    # all-positive advantages should NOT cause explosion (advantage normalization)
+    log_probs3 = torch.randn(N, device=DEVICE, requires_grad=True)
+    all_pos_adv = torch.ones(N, device=DEVICE) * 10.0
+    loss_all_pos = pmpo_loss(log_probs3, all_pos_adv, None, alpha=0.5, beta=0.3)
+    check("all-positive advantages finite", loss_all_pos.isfinite().item(),
+          f"loss={loss_all_pos.item():.4f}")
+
+    # with action_dim normalization + entropy
+    log_probs4 = torch.randn(N, device=DEVICE, requires_grad=True) + 5.0  # high log_probs (continuous)
+    loss_cont = pmpo_loss(log_probs4, advantages, log_probs_prior,
+                          alpha=0.5, beta=0.3, action_dim=6, entropy_coef=3e-4)
+    check("continuous action loss finite", loss_cont.isfinite().item(),
+          f"loss={loss_cont.item():.4f}")
+
 
 def test_dynamics_integration():
     """Test that agent.py heads work with Dynamics model agent token output."""

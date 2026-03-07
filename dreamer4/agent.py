@@ -468,15 +468,17 @@ def pmpo_loss(
     log_probs_prior: Optional[torch.Tensor] = None,
     alpha: float = 0.5,
     beta: float = 0.3,
+    action_dim: int = 1,
+    entropy_coef: float = 3e-4,
 ) -> torch.Tensor:
     """PMPO policy loss from Dreamer 4.
 
-    L = -α * mean(log π(a|s) for s in D+) - (1-α) * mean(log π(a|s) for s in D-)
-        + β * KL(π || π_prior)
+    L = -α * mean(log π(a|s) for s in D+) + (1-α) * mean(log π(a|s) for s in D-)
+        + entropy_coef * mean(log π)          [entropy regularization]
+        + β * mean(log π - log π_prior)       [KL to behavioral prior]
 
-    where D+ = {s : A_s > 0}, D- = {s : A_s ≤ 0}
-
-    The KL term is approximated as: mean(log π - log π_prior) (reverse KL sample estimate).
+    where D+ = {s : A_s > 0}, D- = {s : A_s ≤ 0}, with advantages normalized
+    to zero mean / unit std before splitting.
 
     Args:
         log_probs: (N,) log π(a|s) under current policy
@@ -484,32 +486,41 @@ def pmpo_loss(
         log_probs_prior: (N,) log π_prior(a|s) under frozen behavioral prior, or None
         alpha: weight for positive advantages (0.5 = equal weight)
         beta: KL regularization coefficient
+        action_dim: number of action dimensions (for normalizing continuous log_probs)
+        entropy_coef: coefficient for entropy regularization (prevents std collapse)
 
     Returns:
         scalar loss
     """
+    # Normalize log_probs by action_dim for scale-invariance
+    lp = log_probs / max(action_dim, 1)
+
+    # Normalize advantages to zero mean / unit std.
+    # Ensures ~50/50 D+/D- split so the two branches counterbalance
+    # each other on std, preventing the all-positive runaway.
+    adv_std = advantages.std()
+    if adv_std > 1e-8:
+        advantages = (advantages - advantages.mean()) / adv_std
+
     pos_mask = (advantages > 0).float()
     neg_mask = 1.0 - pos_mask
 
     n_pos = pos_mask.sum().clamp(min=1.0)
     n_neg = neg_mask.sum().clamp(min=1.0)
 
-    # Policy gradient: maximize log prob on D+, minimize on D-
-    # The sign flip in D- means: we WANT low log_prob on bad states
-    # Actually, re-reading the paper: D- uses sign(A) = -1, so the objective is
-    # to increase log_prob on D+ and decrease on D-.
-    # Loss = -(α * mean_D+(log_pi) + (1-α) * mean_D-(sign(A) * log_pi))
-    # Since sign(A) < 0 for D-, this naturally pushes log_pi down for D-.
-
-    loss_pos = -(pos_mask * log_probs).sum() / n_pos
-    loss_neg = (neg_mask * log_probs).sum() / n_neg  # push down log_prob for negative advantages
+    loss_pos = -(pos_mask * lp).sum() / n_pos
+    loss_neg = (neg_mask * lp).sum() / n_neg
 
     policy_loss = alpha * loss_pos + (1.0 - alpha) * loss_neg
 
-    # KL to behavioral prior
+    # Entropy regularization: minimize mean(lp) ≈ maximize entropy.
+    # Prevents std collapse for continuous actions even with balanced advantages.
+    entropy_loss = entropy_coef * lp.mean()
+
+    # KL to behavioral prior (also normalized by action_dim)
     kl_loss = torch.tensor(0.0, device=log_probs.device)
     if log_probs_prior is not None and beta > 0:
-        # Reverse KL: E_π[log π - log π_prior]
-        kl_loss = (log_probs - log_probs_prior).mean()
+        lp_prior = log_probs_prior / max(action_dim, 1)
+        kl_loss = (lp - lp_prior).mean()
 
-    return policy_loss + beta * kl_loss
+    return policy_loss + entropy_loss + beta * kl_loss

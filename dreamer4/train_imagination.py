@@ -584,6 +584,8 @@ def train(args):
                         log_probs_prior=lp_prior.reshape(-1),
                         alpha=args.alpha,
                         beta=args.beta,
+                        action_dim=action_dim,
+                        entropy_coef=args.entropy_coef,
                     )
 
                     total_loss = args.w_policy * policy_loss + args.w_value * value_loss
@@ -703,6 +705,7 @@ if __name__ == "__main__":
     # PMPO
     p.add_argument("--alpha", type=float, default=0.5, help="PMPO sign-split weight")
     p.add_argument("--beta", type=float, default=0.3, help="PMPO KL regularization")
+    p.add_argument("--entropy_coef", type=float, default=3e-4, help="Entropy regularization coefficient")
 
     # Loss weights
     p.add_argument("--w_policy", type=float, default=1.0)
