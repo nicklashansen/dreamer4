@@ -231,17 +231,17 @@ def test_dynamics_integration():
     reward = RewardHead(d_model=D).to(DEVICE)
     value = ValueHead(d_model=D).to(DEVICE)
 
-    a = policy.sample(h)
+    a = policy.sample(h, step=0)
     check("policy from dynamics h_t", a.shape == (B, T, ACTION_DIM))
 
-    r = reward.predict(h)
+    r = reward.predict(h, step=0)
     check("reward from dynamics h_t", r.shape == (B, T))
 
     v = value.predict(h)
     check("value from dynamics h_t", v.shape == (B, T))
 
     # full backward through everything
-    loss = -policy.log_prob(h, a).mean() + reward.loss(h, r.detach()) + value.loss(h, v.detach())
+    loss = -policy.log_prob(h, a, step=0).mean() + reward.loss(h, r.detach()) + value.loss(h, v.detach())
     loss.backward()
     dyn_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 for p in dyn.parameters())
     check("gradient flows through dynamics", dyn_has_grad)

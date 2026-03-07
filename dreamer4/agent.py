@@ -161,8 +161,29 @@ class TanhNormal:
         x = self._normal.rsample()
         return torch.tanh(x)
 
+    def rsample_with_log_prob(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample and compute log_prob without atanh round-trip (TD-MPC2 style).
+
+        This is more numerically stable than rsample() + log_prob() because it
+        computes the Jacobian directly from the pre-tanh sample, avoiding the
+        lossy atanh(tanh(x)) round-trip when actions saturate near ±1.
+
+        Returns:
+            actions: (..., action_dim) in [-1, 1]
+            log_prob: (...) log probabilities
+        """
+        x = self._normal.rsample()
+        actions = torch.tanh(x)
+        log_p = self._normal.log_prob(x)
+        # Jacobian: -sum(log(1 - tanh(x)^2)), computed from x directly
+        log_p = log_p - torch.log(torch.relu(1 - actions.pow(2)) + 1e-6).sum(dim=-1)
+        return actions, log_p
+
     def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
-        """Log prob of actions in [-1, 1] with Jacobian correction.
+        """Log prob of external actions in [-1, 1] with Jacobian correction.
+
+        For log_prob of freshly sampled actions, prefer rsample_with_log_prob()
+        which avoids the lossy atanh round-trip.
 
         Args:
             actions: (..., action_dim) in [-1, 1]
@@ -170,18 +191,11 @@ class TanhNormal:
         Returns:
             (...) log probabilities
         """
-        # Inverse tanh to get pre-tanh value
-        # Clamp to avoid atanh(±1) = ±inf
-        actions_clamped = actions.clamp(-0.999, 0.999)
-        x = torch.atanh(actions_clamped)
-
-        # Normal log prob in pre-tanh space
+        # Inverse tanh to get pre-tanh value (lossy near ±1)
+        x = torch.atanh(actions.clamp(-0.999, 0.999))
         log_p = self._normal.log_prob(x)
-
-        # Jacobian correction: -sum(log(1 - tanh(x)^2))
-        # = -sum(log(1 - a^2)) since a = tanh(x)
-        log_p = log_p - torch.log(1 - actions_clamped.pow(2) + 1e-6).sum(dim=-1)
-
+        # Jacobian correction (TD-MPC2 style: relu + eps for safety)
+        log_p = log_p - torch.log(torch.relu(1 - actions.clamp(-0.999, 0.999).pow(2)) + 1e-6).sum(dim=-1)
         return log_p
 
     @property
@@ -211,14 +225,14 @@ class PolicyHead(nn.Module):
         hidden: int = 512,
         mlp_depth: int = 2,
         mtp_length: int = 8,
-        min_std: float = 0.1,
-        init_std: float = 0.5,
+        log_std_min: float = -5.0,
+        log_std_max: float = 2.0,
     ):
         super().__init__()
         self.action_dim = int(action_dim)
         self.mtp_length = int(mtp_length)
-        self.min_std = float(min_std)
-        self._init_std = float(init_std)
+        self.log_std_min = float(log_std_min)
+        self.log_std_max = float(log_std_max)
 
         # One MLP outputs mean + raw_std for all L future steps
         out_dim = mtp_length * action_dim * 2  # mean and raw_std
@@ -239,38 +253,46 @@ class PolicyHead(nn.Module):
         mu = raw[..., 0]   # (B, T, L, A) — pre-tanh, unbounded
         std_raw = raw[..., 1]
 
-        std = F.softplus(std_raw + math.log(math.exp(self._init_std - self.min_std) - 1.0)) + self.min_std
+        # Bounded log_std via tanh (TD-MPC2 style)
+        # log_std ∈ [log_std_min, log_std_max] → std ∈ [exp(min), exp(max)]
+        # With defaults: std ∈ [0.0067, 7.389]
+        log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (torch.tanh(std_raw) + 1)
+        std = torch.exp(log_std)
 
         return mu, std
 
-    def dist(self, h_t: torch.Tensor, step: int = 0) -> TanhNormal:
-        """Get TanhNormal action distribution for a specific MTP step.
+    def dist(self, h_t: torch.Tensor, step: Optional[int] = None) -> TanhNormal:
+        """Get TanhNormal action distribution.
 
         Args:
             h_t: (B, T, d_model)
-            step: which MTP step (0 = next action)
+            step: if given, return dist for that MTP step only (batch shape (B, T));
+                  if None, return dist for all L steps (batch shape (B, T, L))
 
         Returns:
-            TanhNormal distribution, event shape (action_dim,), batch shape (B, T)
+            TanhNormal distribution with event shape (action_dim,)
         """
-        mu, std = self.forward(h_t)
-        return TanhNormal(mu[:, :, step], std[:, :, step])
+        mu, std = self.forward(h_t)  # (B, T, L, A)
+        if step is not None:
+            return TanhNormal(mu[:, :, step], std[:, :, step])
+        return TanhNormal(mu, std)
 
-    def sample(self, h_t: torch.Tensor, step: int = 0) -> torch.Tensor:
+    def sample(self, h_t: torch.Tensor, step: Optional[int] = None) -> torch.Tensor:
         """Sample actions in [-1, 1].
 
-        Returns: (B, T, action_dim)
+        Returns: (B, T, action_dim) if step given, else (B, T, L, action_dim)
         """
         return self.dist(h_t, step).rsample()
 
-    def log_prob(self, h_t: torch.Tensor, actions: torch.Tensor, step: int = 0) -> torch.Tensor:
+    def log_prob(self, h_t: torch.Tensor, actions: torch.Tensor,
+                 step: Optional[int] = None) -> torch.Tensor:
         """Log prob of actions under the TanhNormal policy.
 
         Args:
             h_t: (B, T, d_model)
-            actions: (B, T, action_dim) in [-1, 1]
+            actions: (B, T, action_dim) if step given, else (B, T, L, action_dim)
 
-        Returns: (B, T)
+        Returns: (B, T) if step given, else (B, T, L)
         """
         return self.dist(h_t, step).log_prob(actions)
 
@@ -316,12 +338,20 @@ class RewardHead(nn.Module):
         raw = self.mlp(h_t)  # (B, T, L*num_bins)
         return raw.view(B, T, self.mtp_length, self.num_bins)
 
-    def dist(self, h_t: torch.Tensor, step: int = 0) -> TwoHotDist:
-        logits = self.forward(h_t)
-        return TwoHotDist(logits[:, :, step], low=self.low, high=self.high)
+    def dist(self, h_t: torch.Tensor, step: Optional[int] = None) -> TwoHotDist:
+        """Get reward distribution.
 
-    def predict(self, h_t: torch.Tensor, step: int = 0) -> torch.Tensor:
-        """Predicted reward (expected value). Returns (B, T)."""
+        Args:
+            step: if given, return dist for that MTP step only (batch shape (B, T));
+                  if None, return dist for all L steps (batch shape (B, T, L))
+        """
+        logits = self.forward(h_t)  # (B, T, L, num_bins)
+        if step is not None:
+            return TwoHotDist(logits[:, :, step], low=self.low, high=self.high)
+        return TwoHotDist(logits, low=self.low, high=self.high)
+
+    def predict(self, h_t: torch.Tensor, step: Optional[int] = None) -> torch.Tensor:
+        """Predicted reward (expected value). Returns (B, T) or (B, T, L)."""
         return self.dist(h_t, step).mean
 
     def loss(self, h_t: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:

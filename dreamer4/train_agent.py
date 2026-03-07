@@ -199,20 +199,20 @@ def bc_loss(
         loss: scalar
         aux: dict
     """
-    mu, std = policy(h_t)  # (B, T, L, A), (B, T, L, A) — mu is pre-tanh
+    mu, std = policy(h_t)  # (B, T, L, A)
     B, T, L, A = mu.shape
 
+    # MTP: for step l, target is action at t+l (time-shifted), so we must
+    # slice per-step. Can't use policy.log_prob(step=None) directly here.
     total_nll = torch.tensor(0.0, device=h_t.device)
     count = 0
     for l in range(min(L, mtp_length)):
         valid_T = T - l
         if valid_T <= 0:
             break
-        # Actions at time t+l for input at time t
-        target_actions = actions[:, l:l + valid_T, :A]  # (B, valid_T, A)
-
-        d = TanhNormal(mu[:, :valid_T, l, :A], std[:, :valid_T, l, :A])
-        nll = -d.log_prob(target_actions.clamp(-1, 1))  # (B, valid_T)
+        target_actions = actions[:, l:l + valid_T, :A].clamp(-1, 1)
+        dist_l = TanhNormal(mu[:, :valid_T, l, :A], std[:, :valid_T, l, :A])
+        nll = -dist_l.log_prob(target_actions)  # (B, valid_T)
         total_nll = total_nll + nll.mean()
         count += 1
 

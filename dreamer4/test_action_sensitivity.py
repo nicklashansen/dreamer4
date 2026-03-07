@@ -162,9 +162,9 @@ def main():
     print("="*60)
 
     with torch.no_grad():
-        r_orig = reward_head.predict(h_o)
-        r_rand = reward_head.predict(h_r)
-        r_zero = reward_head.predict(h_z)
+        r_orig = reward_head.predict(h_o, step=0)
+        r_rand = reward_head.predict(h_r, step=0)
+        r_zero = reward_head.predict(h_z, step=0)
 
     print(f"  Reward (orig actions): mean={r_orig.mean():.4f}, std={r_orig.std():.4f}")
     print(f"  Reward (rand actions): mean={r_rand.mean():.4f}, std={r_rand.std():.4f}")
@@ -262,7 +262,7 @@ def main():
     with torch.no_grad():
         # Sample multiple times from same h_t
         h_sample = h_o[:, 4:5]  # (B, 1, d_model) — single timestep
-        samples = [policy.sample(h_sample).cpu() for _ in range(10)]
+        samples = [policy.sample(h_sample, step=0).cpu() for _ in range(10)]
         samples = torch.stack(samples)  # (10, B, 1, action_dim)
 
         print(f"  Action samples from same h_t (10 draws):")
