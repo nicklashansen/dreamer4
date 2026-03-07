@@ -228,8 +228,28 @@ class SpaceSelfAttentionModality(nn.Module):
             return torch.where(is_q_lat, allow_lat_q, allow_nonlat_q)
 
         if self.mode == "wm_agent":
-            # full mixing across modalities
-            return torch.ones((S, S), dtype=torch.bool, device=device)
+            # Per JAX reference:
+            # - Agent queries: attend to everything
+            # - Action queries: attend only to action keys
+            # - Obs queries (spatial, register, shortcut): attend to obs + action (not agent)
+            # - Non-agent queries NEVER see agent keys (firewall)
+            is_q_agent = (q_mod == int(Modality.AGENT))
+            is_q_action = (q_mod == int(Modality.ACTION))
+            is_k_agent = (k_mod == int(Modality.AGENT))
+            is_k_action = (k_mod == int(Modality.ACTION))
+            is_k_obs = (
+                (k_mod == int(Modality.SPATIAL)) |
+                (k_mod == int(Modality.REGISTER)) |
+                (k_mod == int(Modality.SHORTCUT_SIGNAL)) |
+                (k_mod == int(Modality.SHORTCUT_STEP))
+            )
+
+            allow_agent_q = torch.ones((S, S), dtype=torch.bool, device=device)
+            allow_action_q = is_k_action
+            allow_obs_q = is_k_obs | is_k_action
+
+            return torch.where(is_q_agent, allow_agent_q,
+                   torch.where(is_q_action, allow_action_q, allow_obs_q))
 
         if self.mode == "wm_agent_isolated":
             # non-agent tokens: can attend to everything EXCEPT agent tokens

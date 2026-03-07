@@ -237,7 +237,7 @@ class PolicyHead(nn.Module):
         hidden: int = 512,
         mlp_depth: int = 2,
         mtp_length: int = 8,
-        log_std_min: float = -5.0,
+        log_std_min: float = -10.0,
         log_std_max: float = 2.0,
     ):
         super().__init__()
