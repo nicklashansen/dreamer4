@@ -221,7 +221,7 @@ def dynamics_pretrain_loss(
     w_self = 0.9 * sigma_self + 0.1
 
     # Main forward
-    z1_hat_full, _ = dynamics(actions, step_idx_full, sigma_idx_full, z_tilde_full, act_mask=act_mask_full, agent_tokens=agent_tokens)
+    z1_hat_full, h_t_full = dynamics(actions, step_idx_full, sigma_idx_full, z_tilde_full, act_mask=act_mask_full, agent_tokens=agent_tokens)
     z1_hat_emp = z1_hat_full[:B_emp]
     z1_hat_self = z1_hat_full[B_emp:]
 
@@ -255,12 +255,17 @@ def dynamics_pretrain_loss(
     # Combine losses
     loss = ((loss_emp * (B - B_self)) + (loss_self * B_self)) / B
 
+    # h_t from noisy forward pass — used by BC/reward heads in Phase 2
+    # Pool over agent dim: (B, T, n_agent, d_model) → (B, T, d_model)
+    h_t_pooled = h_t_full.mean(dim=2) if h_t_full is not None else None
+
     aux = {
         "flow_mse": flow_per.mean().detach(),
         "bootstrap_mse": boot_mse.detach(),
         "loss_emp": loss_emp.detach(),
         "loss_self": loss_self.detach(),
         "sigma_mean": sigma_full.mean().detach(),
+        "h_t": h_t_pooled,
     }
     return loss, aux
 

@@ -184,14 +184,15 @@ def bc_loss(
     action_dim: int,
     mtp_length: int,
 ) -> tuple:
-    """Behavioral cloning loss: NLL of dataset actions under the policy.
+    """Behavioral cloning loss: masked NLL of dataset actions under the policy.
 
     MTP: for step l, predict action at t+l+1 from h_t at time t.
+    Per-dim log probs are masked so padding dimensions don't contribute.
 
     Args:
-        h_t: (B, T, d_model) — detached agent token outputs
-        actions: (B, T, 16) — dataset actions (aligned: action[t] produced obs[t+1])
-        act_mask: (B, T, 16) — action mask
+        h_t: (B, T, d_model)
+        actions: (B, T, 16) — dataset actions
+        act_mask: (B, T, 16) — 1.0 for valid dims, 0.0 for padding
         action_dim: effective action dimensions for current batch
         mtp_length: multi-token prediction length
 
@@ -202,17 +203,20 @@ def bc_loss(
     mu, std = policy(h_t)  # (B, T, L, A)
     B, T, L, A = mu.shape
 
-    # MTP: for step l, target is action at t+l (time-shifted), so we must
-    # slice per-step. Can't use policy.log_prob(step=None) directly here.
     total_nll = torch.tensor(0.0, device=h_t.device)
     count = 0
     for l in range(min(L, mtp_length)):
         valid_T = T - l
         if valid_T <= 0:
             break
-        target_actions = actions[:, l:l + valid_T, :A].clamp(-1, 1)
+        target = actions[:, l:l + valid_T, :A].clamp(-1, 1)
+        mask_l = act_mask[:, l:l + valid_T, :A]  # (B, valid_T, A)
+
         dist_l = TanhNormal(mu[:, :valid_T, l, :A], std[:, :valid_T, l, :A])
-        nll = -dist_l.log_prob(target_actions)  # (B, valid_T)
+        # Per-dim log prob, masked so padding dims don't contribute
+        per_dim = dist_l.log_prob_per_dim(target)  # (B, valid_T, A)
+        masked = per_dim * mask_l
+        nll = -masked.sum(dim=-1) / mask_l.sum(dim=-1).clamp(min=1)
         total_nll = total_nll + nll.mean()
         count += 1
 
@@ -453,25 +457,14 @@ def train(args):
                         agent_tokens=agent_tokens,
                     )
 
-                    # 2) Get h_t from a clean forward pass (tau=1, finest step)
-                    # for BC and reward heads
-                    dyn_raw = dyn.module if hasattr(dyn, "module") else dyn
-                    emax = int(round(math.log2(k_max)))
-                    step_idxs = torch.full((B, T), emax, device=device, dtype=torch.long)
-                    signal_idxs = torch.full((B, T), k_max - 1, device=device, dtype=torch.long)
-
-                    _, h_t = dyn_raw(
-                        actions, step_idxs, signal_idxs, z1,
-                        act_mask=act_mask_shifted,
-                        agent_tokens=agent_tokens,
-                    )
-                    # h_t: (B, T, n_agent, d_model) — pool over agent dim
-                    h_pooled = h_t.mean(dim=2)  # (B, T, d_model)
+                    # 2) Use h_t from the dynamics forward pass (noisy inputs)
+                    # Per Dreamer4 paper (under Eq. 9) and JAX reference:
+                    # BC/reward heads are supervised on h_t from the SAME forward
+                    # pass as the dynamics loss, not from a separate clean pass.
+                    h_pooled = dyn_aux["h_t"]  # (B, T, d_model)
 
                     # Phase 2: do NOT detach h_t — gradients from heads
                     # flow back to task_embedder and dynamics agent-token path.
-                    # (In isolated mode, agent tokens only self-attend, so this
-                    # mainly updates the task_embedder + transformer MLP on agents.)
 
                     # 3) BC loss
                     bc_l, bc_aux = bc_loss(

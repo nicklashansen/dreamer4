@@ -189,13 +189,25 @@ class TanhNormal:
             actions: (..., action_dim) in [-1, 1]
 
         Returns:
-            (...) log probabilities
+            (...) log probabilities (summed over action dims)
         """
-        # Inverse tanh to get pre-tanh value (lossy near ±1)
-        x = torch.atanh(actions.clamp(-0.999, 0.999))
-        log_p = self._normal.log_prob(x)
-        # Jacobian correction (TD-MPC2 style: relu + eps for safety)
-        log_p = log_p - torch.log(torch.relu(1 - actions.clamp(-0.999, 0.999).pow(2)) + 1e-6).sum(dim=-1)
+        return self.log_prob_per_dim(actions).sum(dim=-1)
+
+    def log_prob_per_dim(self, actions: torch.Tensor) -> torch.Tensor:
+        """Per-dimension log prob with Jacobian correction.
+
+        Args:
+            actions: (..., action_dim) in [-1, 1]
+
+        Returns:
+            (..., action_dim) per-dimension log probabilities
+        """
+        a = actions.clamp(-0.999, 0.999)
+        x = torch.atanh(a)
+        # Per-dim normal log prob (without Independent reduction)
+        log_p = self._normal.base_dist.log_prob(x)
+        # Per-dim Jacobian correction
+        log_p = log_p - torch.log(torch.relu(1 - a.pow(2)) + 1e-6)
         return log_p
 
     @property
