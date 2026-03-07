@@ -124,7 +124,7 @@ def test_reward_head():
     h_t = torch.randn(B, T, D, device=DEVICE, requires_grad=True)
 
     logits = head(h_t)
-    check("logits shape", logits.shape == (B, T, MTP_L, 255), f"got {logits.shape}")
+    check("logits shape", logits.shape == (B, T, MTP_L, 101), f"got {logits.shape}")
 
     pred = head.predict(h_t, step=0)
     check("predict shape", pred.shape == (B, T), f"got {pred.shape}")

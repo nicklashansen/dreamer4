@@ -419,9 +419,9 @@ class RewardHead(nn.Module):
         hidden: int = 512,
         mlp_depth: int = 2,
         mtp_length: int = 8,
-        num_bins: int = 255,
-        low: float = -20.0,
-        high: float = 20.0,
+        num_bins: int = 101,
+        low: float = -10.0,
+        high: float = 10.0,
     ):
         super().__init__()
         self.mtp_length = int(mtp_length)
@@ -506,9 +506,9 @@ class ValueHead(nn.Module):
         d_model: int = 512,
         hidden: int = 512,
         mlp_depth: int = 2,
-        num_bins: int = 255,
-        low: float = -20.0,
-        high: float = 20.0,
+        num_bins: int = 101,
+        low: float = -10.0,
+        high: float = 10.0,
     ):
         super().__init__()
         self.num_bins = int(num_bins)
