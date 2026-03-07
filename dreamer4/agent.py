@@ -471,20 +471,20 @@ def pmpo_loss(
     action_dim: int = 1,
     entropy_coef: float = 3e-4,
 ) -> torch.Tensor:
-    """PMPO policy loss from Dreamer 4.
+    """Policy loss with advantage-weighted policy gradient + KL + entropy.
 
-    L = -α * mean(log π(a|s) for s in D+) + (1-α) * mean(log π(a|s) for s in D-)
-        + entropy_coef * mean(log π)          [entropy regularization]
-        + β * mean(log π - log π_prior)       [KL to behavioral prior]
+    L = -mean(normalize(A) * log π / action_dim)   [advantage-weighted PG]
+        + entropy_coef * mean(log π / action_dim)   [entropy regularization]
+        + β * mean(log π - log π_prior) / action_dim [KL to behavioral prior]
 
-    where D+ = {s : A_s > 0}, D- = {s : A_s ≤ 0}, with advantages normalized
-    to zero mean / unit std before splitting.
+    Advantages are normalized to zero mean / unit std. When advantages have
+    near-zero variance (all similar), they are zeroed out → no gradient.
 
     Args:
         log_probs: (N,) log π(a|s) under current policy
         advantages: (N,) advantage estimates A_s = R^λ_s - v_s
         log_probs_prior: (N,) log π_prior(a|s) under frozen behavioral prior, or None
-        alpha: weight for positive advantages (0.5 = equal weight)
+        alpha: unused (kept for API compatibility)
         beta: KL regularization coefficient
         action_dim: number of action dimensions (for normalizing continuous log_probs)
         entropy_coef: coefficient for entropy regularization (prevents std collapse)
@@ -496,25 +496,22 @@ def pmpo_loss(
     lp = log_probs / max(action_dim, 1)
 
     # Normalize advantages to zero mean / unit std.
-    # Ensures ~50/50 D+/D- split so the two branches counterbalance
-    # each other on std, preventing the all-positive runaway.
     adv_std = advantages.std()
     if adv_std > 1e-8:
         advantages = (advantages - advantages.mean()) / adv_std
+    else:
+        # No meaningful advantage signal — zero out to prevent runaway
+        advantages = torch.zeros_like(advantages)
 
-    pos_mask = (advantages > 0).float()
-    neg_mask = 1.0 - pos_mask
-
-    n_pos = pos_mask.sum().clamp(min=1.0)
-    n_neg = neg_mask.sum().clamp(min=1.0)
-
-    loss_pos = -(pos_mask * lp).sum() / n_pos
-    loss_neg = (neg_mask * lp).sum() / n_neg
-
-    policy_loss = alpha * loss_pos + (1.0 - alpha) * loss_neg
+    # Advantage-weighted policy gradient.
+    # More robust than sign-split for continuous actions: when all advantages
+    # are similar, normalized advantages → 0 → no gradient (correct behavior).
+    # When there's real signal, positive advantages push log_prob up,
+    # negative push down, proportional to magnitude.
+    policy_loss = -(advantages.detach() * lp).mean()
 
     # Entropy regularization: minimize mean(lp) ≈ maximize entropy.
-    # Prevents std collapse for continuous actions even with balanced advantages.
+    # Prevents std collapse for continuous actions.
     entropy_loss = entropy_coef * lp.mean()
 
     # KL to behavioral prior (also normalized by action_dim)
