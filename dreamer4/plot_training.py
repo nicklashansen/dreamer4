@@ -54,12 +54,15 @@ def parse_phase3_log(path: Path) -> dict:
     """Parse phase3.log for training metrics."""
     steps, total, pi, val = [], [], [], []
     adv_pos, R, r, V = [], [], [], []
+    pi_std = []
 
     pattern = re.compile(
         r"step (\d+) \| "
-        r"total=([\d.]+) pi=([\d.]+) val=([\d.]+) "
+        r"total=([-\d.]+) pi=([-\d.]+) val=([-\d.]+) "
         r"\| adv\+=([\d.]+) R=([-\d.]+) r=([-\d.]+) V=([-\d.]+)"
     )
+    std_pattern = re.compile(r"std=([\d.]+) \|")
+
     with open(path) as f:
         for line in f:
             m = pattern.search(line)
@@ -72,6 +75,8 @@ def parse_phase3_log(path: Path) -> dict:
                 R.append(float(m.group(6)))
                 r.append(float(m.group(7)))
                 V.append(float(m.group(8)))
+                sm = std_pattern.search(line)
+                pi_std.append(float(sm.group(1)) if sm else float("nan"))
 
     return {
         "steps": np.array(steps),
@@ -82,6 +87,7 @@ def parse_phase3_log(path: Path) -> dict:
         "lambda_return": np.array(R),
         "mean_reward": np.array(r),
         "mean_value": np.array(V),
+        "policy_std": np.array(pi_std),
     }
 
 
@@ -103,7 +109,7 @@ def smooth_x(x, window=3):
 
 def plot_phase2(data: dict, out_path: Path):
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-    fig.suptitle("Phase 2: Agent Finetuning (cartpole-balance)", fontsize=14, fontweight="bold")
+    fig.suptitle("Phase 2: Agent Finetuning", fontsize=14, fontweight="bold")
     w = 5
 
     ax = axes[0, 0]
@@ -156,7 +162,7 @@ def plot_phase2(data: dict, out_path: Path):
 
 def plot_phase3(data: dict, out_path: Path):
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-    fig.suptitle("Phase 3: Imagination RL (cartpole-balance)", fontsize=14, fontweight="bold")
+    fig.suptitle("Phase 3: Imagination RL", fontsize=14, fontweight="bold")
     w = 5
 
     ax = axes[0, 0]
@@ -193,8 +199,12 @@ def plot_phase3(data: dict, out_path: Path):
     ax.grid(True, alpha=0.3)
 
     ax = axes[1, 2]
-    ax.plot(smooth_x(data["steps"], w), smooth(data["mean_value"], w), "b-", alpha=0.8)
-    ax.set_title("Mean Value Estimate")
+    if not np.all(np.isnan(data.get("policy_std", []))):
+        ax.plot(smooth_x(data["steps"], w), smooth(data["policy_std"], w), "b-", alpha=0.8)
+        ax.set_title("Policy Std")
+    else:
+        ax.plot(smooth_x(data["steps"], w), smooth(data["mean_value"], w), "b-", alpha=0.8)
+        ax.set_title("Mean Value Estimate")
     ax.set_xlabel("Step")
     ax.grid(True, alpha=0.3)
 
