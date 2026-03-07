@@ -2,14 +2,20 @@
 
 ## TL;DR
 
-Phase 2 (BC + reward) works on expert-only data but the reward model learns a
-constant (~1.718) because expert data has uniform high reward. Phase 3 (imagination
-RL) then explodes because the reward model gives no signal. Training Phase 2 on
-mixed data fixes reward diversity but breaks BC (TanhNormal can't fit multimodal
-actions, std maxes out, BC loss diverges, corrupts dynamics).
+Phase 2 (BC + reward) is now training stably on mixed data (expert + mixed-small)
+with RMS loss normalization + loss clipping. Phase 3 (imagination RL) showed
+promising early results — policy std decreased, advantages had real signal, no
+explosion. The current v6 Phase 2 run is the best so far. Once it checkpoints,
+feed it to Phase 3.
 
-**Blocking issue**: the reward head needs diverse data, but BC needs clean expert data.
-We need to decouple them — see "Next Steps" below.
+---
+
+## Currently Running
+
+**Phase 2 v6** on GPU 3 — mixed data, RMS normalization + loss clipping
+- Log: `tail -f /data/dreamer4/runs/walker-walk-v6/phase2.log`
+- Checkpoints: `/data/dreamer4/runs/walker-walk-v6/phase2/`
+- Early results look great (bc=-0.03, std=0.88, rew=0.80 at step 275)
 
 ---
 
@@ -18,134 +24,67 @@ We need to decouple them — see "Next Steps" below.
 - **Repo**: `/data/dreamer4/dreamer4/` on branch `RL-dev`
 - **Conda env**: `~/miniforge3/envs/dreamer4/` (Python 3.10, PyTorch 2.8.0+cu128)
 - **Pre-trained checkpoints**: `../logs/tokenizer.pt`, `../logs/dynamics.pt`
-- **Data**: `/public/dreamer4/` — expert, mixed-small, mixed-large (+ corresponding `-shards/` dirs)
+- **Data**: `/public/dreamer4/` — expert, mixed-small, mixed-large (+ `-shards/` dirs)
 
 ### Key files
 | File | Purpose |
 |------|---------|
 | `agent.py` | PolicyHead (TanhNormal), RewardHead, ValueHead (TwoHotDist), lambda returns, PMPO loss |
-| `train_agent.py` | Phase 2: BC + reward prediction + dynamics finetuning |
+| `train_agent.py` | Phase 2: BC + reward + dynamics finetuning (RMS norm + loss clipping) |
 | `train_imagination.py` | Phase 3: imagined rollouts, TD(lambda) + PMPO policy gradient |
-| `train_dynamics.py` | Dynamics pre-training (unchanged, but exports helpers) |
 | `model.py` | Tokenizer, Dynamics, attention masks |
 | `test_components.py` | 47 smoke tests for all RL components |
 | `test_action_sensitivity.py` | Verifies dynamics h_t responds to different actions |
+| `plot_training.py` | Generate training curve plots from log files |
 
 ---
 
-## What Works
+## Key Fixes This Session
 
-### Phase 2 on expert-only data (walker-walk-v3)
-Converges well over 1000+ steps:
-```
-step 0000000 | bc=1435.9  rew=4.62  | std=0.019 r_pred=0.016 r_tgt=1.997
-step 0000500 | bc=-3.20   rew=0.67  | std=0.637 r_pred=1.718 r_tgt=1.997
-step 0001000 | bc=-3.45   rew=0.67  | std=0.500 r_pred=1.714 r_tgt=1.988
-```
-- BC loss decreases nicely, policy learns expert actions
-- But `r_pred=1.718` and `r_tgt=1.997` are CONSTANT — reward model just learns "reward is always ~1.7"
-- Checkpoints at `/data/dreamer4/runs/walker-walk-v3/phase2/step_0001000.pt`
+### 1. RMS Loss Normalization (Dreamer v4 paper)
+"We normalize all loss terms by running estimates of their RMS."
+Each loss is divided by `max(1.0, EMA(|loss|))` so BC (which can be ~1400 at init)
+doesn't dominate dynamics (~0.01) and reward (~4.6). Without this, mixed data
+caused BC to dominate gradients and corrupt the dynamics model.
 
-### Component tests
-All 47 tests pass:
-```bash
-cd /data/dreamer4/dreamer4
-python test_components.py
-```
+### 2. Loss Clipping
+Each loss is clamped to `max(5.0, 5 * rms_ema)` before backprop. This prevents
+single outlier batches from causing catastrophic collapse. In v5, training was
+going well (bc=0.22, std=1.08 at step 850) then a single bad batch spiked bc
+to 37.7 and reset std to 7.3. Loss clipping prevents this.
+
+### 3. Mixed Data for Reward Diversity
+Expert-only data has near-constant reward (~2.0), so the reward model learned
+to predict constant 1.718 — useless for Phase 3. Mixed-small data has reward
+range 0.006-2.0 (mean 1.13, std 0.74), giving the reward model real signal.
+
+### 4. wm_agent Attention Mask Reverted
+Tried a JAX-reference firewall mask (non-agent tokens can't see agent tokens).
+Broke Phase 3 because the dynamics was fine-tuned with all-to-all attention.
+Reverted to `torch.ones((S,S))` — **do NOT change this mask**.
 
 ---
 
-## What Doesn't Work
+## How to Read Phase 3 Metrics
 
-### Phase 3 (imagination RL) — policy loss explodes
-From v3 Phase 2 checkpoint:
-```
-step 0000000 | pi=-0.01   val=4.61  | adv+=1.00 r=1.716 V=-0.009
-step 0000050 | pi=1.67    val=3.45  | adv+=1.00 r=1.716 V=41.161
-step 0000100 | pi=213917  val=1.73  | adv+=1.00 r=1.716 V=23.087
-```
-- `adv+=1.00` — ALL advantages are positive (no negative signal)
-- `r=1.716` — reward prediction is constant regardless of action
-- Policy loss explodes to ~500K by step 225
-- Root cause: **reward model predicts constant, so no signal for policy improvement**
-
-### Phase 2 on mixed data (walker-walk-v4) — BC diverges
-Adding mixed-small data for reward diversity:
-```
-step 0000000 | bc=1384.9  rew=4.62  | std=0.019 r_pred=0.017 r_tgt=1.619
-step 0000050 | bc=2.52    rew=4.21  | std=7.389 r_pred=0.043 r_tgt=1.404  <-- std maxed out!
-step 0000300 | bc=261.2   rew=10.95 | std=7.389 r_pred=1.718 r_tgt=1.307  <-- diverging!
-```
-- TanhNormal can't fit multimodal actions (expert + suboptimal), maxes std at exp(2)=7.389
-- BC loss dominates total loss, corrupting dynamics (flow: 0.03 -> 0.20)
-- Reward model also degrades (reverts to constant prediction)
+| Metric | Good sign | Bad sign |
+|--------|-----------|----------|
+| `r` (mean reward) | Increasing over training | Flat or constant |
+| `pi` (policy loss) | Negative and decreasing | Exploding positive |
+| `val` (value loss) | Decreasing toward ~0.5-1.0 | Not converging |
+| `adv+` (frac positive) | 0.3-0.7 (mixed signal) | Stuck at 0 or 1 |
+| `std` (policy std) | Gradually decreasing to 0.3-1.0 | Stuck at max (7.4) or collapsed to 0 |
+| `R` (lambda return) | Increasing | Flat |
 
 ---
 
 ## Data
 
-| Source | Path | walker-walk reward stats |
-|--------|------|------------------------|
-| expert | `/public/dreamer4/expert` | mean=1.963, std=0.230, p10=1.990 (nearly constant ~2.0) |
-| mixed-small | `/public/dreamer4/mixed-small` | mean=1.128, std=0.737, p10=0.099 (good diversity) |
-| mixed-large | `/public/dreamer4/mixed-large` | Not yet tested |
-
-Shards dirs (for frame loading): `/public/dreamer4/{expert,mixed-small,mixed-large}-shards/`
-
----
-
-## Next Steps (Blocking Issue)
-
-The reward head needs diverse data to learn good-vs-bad, but BC needs expert-only data
-to avoid diverging. Two approaches (pick one):
-
-### Option A: Two-stage Phase 2 (recommended — simplest)
-1. Run Phase 2 on expert-only data (already works, v3 checkpoints exist)
-2. Write a small "Phase 2b" script that loads the Phase 2 checkpoint, freezes
-   dynamics + policy, and fine-tunes ONLY the reward head on mixed data
-
-### Option B: Separate data loaders in Phase 2
-Modify `train_agent.py` to accept separate `--bc_data_dirs` and `--reward_data_dirs`.
-BC loss uses expert loader, reward loss uses mixed loader. More elegant but bigger change.
-
-### After reward is fixed
-Re-run Phase 3 imagination RL. With a reward model that gives varied predictions,
-advantages will have real signal (not all-positive), and the policy should improve.
-
----
-
-## Architecture Notes
-
-### Attention mask: `wm_agent`
-- `wm_agent` = `torch.ones((S,S))` — all tokens attend to all tokens
-- The pretrained dynamics used `wm_agent_isolated` (agent tokens only see agent tokens)
-- Phase 2 overrides to `wm_agent` so agent tokens can see actions + spatial state
-- **Do NOT change the wm_agent mask** — the Phase 2 model was fine-tuned with it.
-  We tried a JAX-reference firewall mask and it broke Phase 3 (dynamics output garbage
-  with attention patterns it wasn't trained on).
-
-### Policy: TanhNormal (continuous)
-- Pre-tanh Gaussian, actions = tanh(x), log_prob includes Jacobian correction
-- `rsample_with_log_prob()` avoids lossy atanh round-trip (TD-MPC2 style)
-- Bounded std: log_std in [-10, 2] via tanh (std range [4.5e-5, 7.389])
-- `log_prob_per_dim()` for masked BC loss (some action dims are inactive)
-
-### Reward/Value: TwoHotDist in symlog space
-- 101 bins, symlog range [-10, 10]
-- Target encoded as two-hot between nearest bins
-- Mean = symexp(weighted sum of bin centers)
-
-### PMPO loss (continuous actions)
-- Advantage-weighted policy gradient (not sign-split — that explodes for continuous)
-- Advantages normalized to zero mean / unit std
-- Entropy regularization: `entropy_coef * mean(log_prob / action_dim)`
-- KL to behavioral prior: `beta * mean((log_pi - log_pi_prior) / action_dim)`
-
-### Hyperparameters
-- gamma=0.997, lambda=0.95, alpha=0.5, beta=0.3, entropy_coef=3e-4
-- Phase 2: lr=3e-4 (heads), lr_dynamics=1e-4, batch=16, seq_len=32
-- Phase 3: lr_policy=3e-5, lr_value=3e-4, batch=8, horizon=16, grad_clip=1.0
-- MTP L=8, action_dim=16
+| Source | Path | Shards | walker-walk reward |
+|--------|------|--------|--------------------|
+| expert | `/public/dreamer4/expert` | `/public/dreamer4/expert-shards` | mean=1.96, nearly constant |
+| mixed-small | `/public/dreamer4/mixed-small` | `/public/dreamer4/mixed-small-shards` | mean=1.13, std=0.74, good diversity |
+| mixed-large | `/public/dreamer4/mixed-large` | `/public/dreamer4/mixed-large-shards` | Not yet tested (780 segments) |
 
 ---
 
@@ -157,35 +96,11 @@ cd /data/dreamer4/dreamer4
 python test_components.py
 ```
 
-### Phase 2 — expert-only (WORKS)
+### Phase 2 — mixed data with RMS norm + loss clipping (CURRENT BEST)
 ```bash
 cd /data/dreamer4/dreamer4
-mkdir -p /data/dreamer4/runs/walker-walk-v5/phase2
+mkdir -p /data/dreamer4/runs/walker-walk-v7/phase2
 
-PYTHONUNBUFFERED=1 WANDB_MODE=disabled CUDA_VISIBLE_DEVICES=0 python train_agent.py \
-    --tokenizer_ckpt ../logs/tokenizer.pt \
-    --dynamics_ckpt ../logs/dynamics.pt \
-    --data_dirs /public/dreamer4/expert \
-    --frame_dirs /public/dreamer4/expert-shards \
-    --tasks walker-walk \
-    --space_mode wm_agent \
-    --batch_size 16 \
-    --seq_len 32 \
-    --max_steps 2000 \
-    --log_every 50 \
-    --save_every 500 \
-    --num_workers 4 \
-    --lr 3e-4 \
-    --lr_dynamics 1e-4 \
-    --ckpt_dir /data/dreamer4/runs/walker-walk-v5/phase2 \
-    2>&1 | tee /data/dreamer4/runs/walker-walk-v5/phase2.log
-```
-
-### Phase 2 — mixed data (BROKEN — DO NOT USE until BC/reward decoupled)
-```bash
-cd /data/dreamer4/dreamer4
-# This adds --data_dirs and --frame_dirs for both expert + mixed-small
-# BC loss diverges because TanhNormal can't fit multimodal action distribution
 PYTHONUNBUFFERED=1 WANDB_MODE=disabled CUDA_VISIBLE_DEVICES=0 python train_agent.py \
     --tokenizer_ckpt ../logs/tokenizer.pt \
     --dynamics_ckpt ../logs/dynamics.pt \
@@ -193,20 +108,26 @@ PYTHONUNBUFFERED=1 WANDB_MODE=disabled CUDA_VISIBLE_DEVICES=0 python train_agent
     --frame_dirs /public/dreamer4/expert-shards /public/dreamer4/mixed-small-shards \
     --tasks walker-walk \
     --space_mode wm_agent \
-    --batch_size 16 --seq_len 32 --max_steps 2000 --log_every 50 --save_every 500 \
-    --num_workers 4 --lr 3e-4 --lr_dynamics 1e-4 \
-    --ckpt_dir /data/dreamer4/runs/walker-walk-vX/phase2 \
-    2>&1 | tee /data/dreamer4/runs/walker-walk-vX/phase2.log
+    --batch_size 16 \
+    --seq_len 32 \
+    --max_steps 2000 \
+    --log_every 25 \
+    --save_every 500 \
+    --num_workers 4 \
+    --lr 3e-4 \
+    --lr_dynamics 1e-4 \
+    --ckpt_dir /data/dreamer4/runs/walker-walk-v7/phase2 \
+    2>&1 | tee /data/dreamer4/runs/walker-walk-v7/phase2.log
 ```
 
-### Phase 3 — imagination RL (BROKEN — needs fixed reward model first)
+### Phase 3 — imagination RL (from Phase 2 checkpoint)
 ```bash
 cd /data/dreamer4/dreamer4
-mkdir -p /data/dreamer4/runs/walker-walk-v5/phase3
+mkdir -p /data/dreamer4/runs/walker-walk-v7/phase3
 
-PYTHONUNBUFFERED=1 WANDB_MODE=disabled CUDA_VISIBLE_DEVICES=3 python train_imagination.py \
+PYTHONUNBUFFERED=1 WANDB_MODE=disabled CUDA_VISIBLE_DEVICES=0 python train_imagination.py \
     --tokenizer_ckpt ../logs/tokenizer.pt \
-    --phase2_ckpt /data/dreamer4/runs/walker-walk-v5/phase2/step_0001000.pt \
+    --phase2_ckpt /data/dreamer4/runs/walker-walk-v7/phase2/step_0001000.pt \
     --tasks walker-walk \
     --space_mode wm_agent \
     --batch_size 8 \
@@ -219,17 +140,56 @@ PYTHONUNBUFFERED=1 WANDB_MODE=disabled CUDA_VISIBLE_DEVICES=3 python train_imagi
     --gamma 0.997 --lam 0.95 \
     --alpha 0.5 --beta 0.3 --entropy_coef 3e-4 \
     --lr_policy 3e-5 --lr_value 3e-4 \
-    --ckpt_dir /data/dreamer4/runs/walker-walk-v5/phase3 \
-    2>&1 | tee /data/dreamer4/runs/walker-walk-v5/phase3.log
+    --ckpt_dir /data/dreamer4/runs/walker-walk-v7/phase3 \
+    2>&1 | tee /data/dreamer4/runs/walker-walk-v7/phase3.log
+```
+
+### Plot training curves
+```bash
+cd /data/dreamer4/dreamer4
+python plot_training.py /data/dreamer4/runs/walker-walk-v6/
 ```
 
 ### Action sensitivity test
 ```bash
 cd /data/dreamer4/dreamer4
 CUDA_VISIBLE_DEVICES=0 python test_action_sensitivity.py \
-    /data/dreamer4/runs/walker-walk-v3/phase2/step_0001000.pt \
+    /data/dreamer4/runs/walker-walk-v6/phase2/step_0001000.pt \
     ../logs/tokenizer.pt
 ```
+
+---
+
+## Architecture Notes
+
+### Attention mask: `wm_agent`
+- `wm_agent` = `torch.ones((S,S))` — all tokens attend to all tokens
+- Pre-trained dynamics used `wm_agent_isolated`, Phase 2 overrides to `wm_agent`
+- **Do NOT change this mask** — model was fine-tuned with it
+
+### Policy: TanhNormal (continuous)
+- Pre-tanh Gaussian, actions = tanh(x), Jacobian-corrected log_prob
+- `rsample_with_log_prob()` for numerically stable sampling (TD-MPC2 style)
+- Bounded std: log_std in [-10, 2] via tanh (std range [4.5e-5, 7.389])
+
+### Reward/Value: TwoHotDist in symlog space
+- 101 bins, symlog range [-10, 10]
+
+### PMPO loss
+- Advantage-weighted PG (not sign-split — that explodes for continuous)
+- Advantages normalized to zero mean / unit std
+- Entropy reg + KL to behavioral prior
+
+### RMS normalization + loss clipping (train_agent.py)
+- Each loss divided by `max(1.0, EMA(|loss|))` with decay=0.99
+- Each loss clamped to `max(5.0, 5 * EMA)` before backprop
+- Prevents any single loss from dominating AND prevents outlier batches from collapsing training
+
+### Hyperparameters
+- gamma=0.997, lambda=0.95, alpha=0.5, beta=0.3, entropy_coef=3e-4
+- Phase 2: lr=3e-4 (heads), lr_dynamics=1e-4, batch=16, seq_len=32
+- Phase 3: lr_policy=3e-5, lr_value=3e-4, batch=8, horizon=16, grad_clip=1.0
+- MTP L=8, action_dim=16
 
 ---
 
@@ -237,19 +197,31 @@ CUDA_VISIBLE_DEVICES=0 python test_action_sensitivity.py \
 
 | Run | Phase | Path | Status |
 |-----|-------|------|--------|
-| walker-walk-v3 | Phase 2 | `/data/dreamer4/runs/walker-walk-v3/phase2/step_0001000.pt` | Good BC, bad reward (constant) |
-| walker-walk-v3 | Phase 3 | (none saved) | Exploded |
-| walker-walk-v4 | Phase 2 | `/data/dreamer4/runs/walker-walk-v4/phase2/` | Diverged (mixed data) |
+| v6 | Phase 2 | `/data/dreamer4/runs/walker-walk-v6/phase2/` | Running (best so far) |
+| v5 | Phase 2 | `/data/dreamer4/runs/walker-walk-v5/phase2/step_0000500.pt` | OK but spiked at step 875 |
+| v5 | Phase 3 | `/data/dreamer4/runs/walker-walk-v5/phase3/` | Promising early results |
+| v3 | Phase 2 | `/data/dreamer4/runs/walker-walk-v3/phase2/step_0001000.pt` | Good BC, constant reward |
 
-Older broken runs (used `wm_agent_isolated`, action-blind):
-- `/data/dreamer4/runs/walker-walk/`
-- `/data/dreamer4/runs/walker-walk-v2/`
-- `/data/dreamer4/runs/cartpole-balance/`
+Older broken runs: `walker-walk/`, `walker-walk-v2/`, `walker-walk-v4/`, `cartpole-balance/`
+
+---
+
+## Run History
+
+| Run | What changed | Result |
+|-----|-------------|--------|
+| v1-v2 | `wm_agent_isolated` | Action-blind, no RL signal |
+| v3 | `wm_agent`, expert-only | BC great, reward constant ~1.718 |
+| v4 | Mixed data, no RMS norm | BC diverged (261+), dynamics degraded |
+| v4-frozen | Mixed data, lr_dynamics=0 | BC oscillated wildly (2 to 394K) |
+| v5 | Mixed data + RMS norm | Stable but BC spiked at step 875, collapsing policy |
+| v6 | Mixed data + RMS norm + loss clipping | Stable, bc=-0.03 std=0.88 at step 275 (running) |
 
 ---
 
 ## Deferred Items
 - Action discretization (tried, reverted — want continuous working first)
-- JAX reference corrections: MTP default L=2, searchsorted for two-hot
 - mixed-large data (780 segments, much more diverse)
-- Adjusting symlog bin ranges per JAX ref (reward [-3,3], value [-8,8] vs current [-10,10])
+- JAX reference corrections: MTP default L=2, searchsorted for two-hot
+- Adjusting symlog bin ranges per JAX ref (reward [-3,3], value [-8,8])
+- RMS normalization for Phase 3 (train_imagination.py) — not yet added
