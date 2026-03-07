@@ -393,6 +393,13 @@ def train(args):
         if is_rank0():
             print(f"Resumed from {args.resume} (step={step}, epoch={start_epoch})")
 
+    # --- RMS loss normalization (Dreamer v4, Section 3) ---
+    # "We normalize all loss terms by running estimates of their RMS."
+    # Each loss is divided by max(1, EMA(sqrt(loss^2))) so all terms
+    # contribute ~equal gradient scale regardless of raw magnitude.
+    rms_ema = {"dyn": 1.0, "bc": 1.0, "rew": 1.0}
+    rms_decay = 0.99
+
     # --- Training loop ---
     dyn.train()
     policy.train()
@@ -476,11 +483,22 @@ def train(args):
                     # 4) Reward loss
                     rw_l, rw_aux = reward_loss(reward_head, h_pooled, rew)
 
-                    # Total loss
+                    # RMS-normalize each loss (Dreamer v4 paper) + loss clipping
+                    with torch.no_grad():
+                        rms_ema["dyn"] = rms_decay * rms_ema["dyn"] + (1 - rms_decay) * abs(dyn_loss.item())
+                        rms_ema["bc"] = rms_decay * rms_ema["bc"] + (1 - rms_decay) * abs(bc_l.item())
+                        rms_ema["rew"] = rms_decay * rms_ema["rew"] + (1 - rms_decay) * abs(rw_l.item())
+
+                    # Clip each loss to 5x its running average to prevent spike-driven collapse
+                    clip_mult = 5.0
+                    dyn_clip = max(5.0, clip_mult * rms_ema["dyn"])
+                    bc_clip = max(5.0, clip_mult * rms_ema["bc"])
+                    rew_clip = max(5.0, clip_mult * rms_ema["rew"])
+
                     total_loss = (
-                        args.w_dynamics * dyn_loss
-                        + args.w_bc * bc_l
-                        + args.w_reward * rw_l
+                        args.w_dynamics * dyn_loss.clamp(max=dyn_clip) / max(1.0, rms_ema["dyn"])
+                        + args.w_bc * bc_l.clamp(max=bc_clip) / max(1.0, rms_ema["bc"])
+                        + args.w_reward * rw_l.clamp(max=rew_clip) / max(1.0, rms_ema["rew"])
                     )
 
                 if not torch.isfinite(total_loss):
