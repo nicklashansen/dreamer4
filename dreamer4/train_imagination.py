@@ -102,6 +102,7 @@ def load_phase2(
     d_bottleneck: int,
     n_latents: int,
     packing_factor: int,
+    space_mode_override: Optional[str] = None,
 ) -> Tuple[Dynamics, TaskEmbedder, PolicyHead, RewardHead, dict]:
     """Load Phase 2 checkpoint: dynamics + task_embedder + policy + reward."""
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -116,7 +117,7 @@ def load_phase2(
     k_max = int(a.get("k_max", 8))
     n_register = int(a.get("n_register", 4))
     n_agent = int(a.get("n_agent", 1))
-    space_mode = str(a.get("space_mode", "wm_agent_isolated"))
+    space_mode = space_mode_override or str(a.get("space_mode", "wm_agent_isolated"))
     action_dim = int(a.get("action_dim", 16))
     mtp_length = int(a.get("mtp_length", 8))
     head_hidden = int(d_model * float(a.get("head_mlp_ratio", 2.0)))
@@ -413,6 +414,7 @@ def train(args):
         d_bottleneck=d_bottleneck,
         n_latents=n_latents,
         packing_factor=args.packing_factor,
+        space_mode_override=args.space_mode,
     )
     d_model = p2_info["d_model"]
     k_max = p2_info["k_max"]
@@ -694,6 +696,8 @@ if __name__ == "__main__":
     p.add_argument("--phase2_ckpt", type=str, required=True,
                    help="Path to Phase 2 agent checkpoint (dynamics + task_emb + policy + reward)")
     p.add_argument("--packing_factor", type=int, default=2)
+    p.add_argument("--space_mode", type=str, default="wm_agent",
+                   help="Attention mode for agent tokens. 'wm_agent' = full attention.")
 
     # Imagination
     p.add_argument("--horizon", type=int, default=32)

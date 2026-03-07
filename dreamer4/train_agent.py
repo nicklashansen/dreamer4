@@ -112,8 +112,14 @@ def load_pretrained_dynamics(
     d_bottleneck: int,
     n_latents: int,
     packing_factor: int,
+    space_mode_override: Optional[str] = None,
 ) -> tuple:
-    """Load pre-trained dynamics and return model + info dict."""
+    """Load pre-trained dynamics and return model + info dict.
+
+    Args:
+        space_mode_override: if set, override the checkpoint's space_mode.
+            Use "wm_agent" for Phase 2/3 so agent tokens attend to actions/state.
+    """
     ckpt = torch.load(ckpt_path, map_location="cpu")
     a = ckpt.get("args", {}) or {}
 
@@ -126,7 +132,7 @@ def load_pretrained_dynamics(
     k_max = int(a.get("k_max", 8))
     n_register = int(a.get("n_register", 4))
     n_agent = int(a.get("n_agent", 1))
-    space_mode = str(a.get("space_mode", "wm_agent_isolated"))
+    space_mode = space_mode_override or str(a.get("space_mode", "wm_agent_isolated"))
 
     assert n_latents % packing_factor == 0
     n_spatial = n_latents // packing_factor
@@ -298,6 +304,7 @@ def train(args):
         d_bottleneck=d_bottleneck,
         n_latents=n_latents,
         packing_factor=args.packing_factor,
+        space_mode_override=args.space_mode,
     )
     d_model = dyn_info["d_model"]
     k_max = dyn_info["k_max"]
@@ -591,6 +598,9 @@ if __name__ == "__main__":
     p.add_argument("--tokenizer_ckpt", type=str, default="logs/tokenizer.pt")
     p.add_argument("--dynamics_ckpt", type=str, default="logs/dynamics.pt")
     p.add_argument("--packing_factor", type=int, default=2)
+    p.add_argument("--space_mode", type=str, default="wm_agent",
+                   help="Attention mode for agent tokens. Use 'wm_agent' so agent tokens "
+                        "can attend to actions/state (required for RL).")
 
     # Head architecture
     p.add_argument("--action_dim", type=int, default=16)

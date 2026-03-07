@@ -20,6 +20,7 @@ from model import (
     Encoder, Decoder, Tokenizer, Dynamics,
     temporal_patchify, temporal_unpatchify,
 )
+from agent import PolicyHead, RewardHead, ValueHead
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -99,6 +100,10 @@ def sample_one_timestep_packed(
 ) -> torch.Tensor:
     """
     Generate next packed latent z_t: (B,n_spatial,d_spatial) given past length t.
+
+    Returns:
+        z: (B, n_spatial, d_spatial)
+        h_t: (B, n_agent, d_model) or None — agent tokens from last denoising step
     """
     device = past_packed.device
     dtype = past_packed.dtype
@@ -134,7 +139,7 @@ def sample_one_timestep_packed(
         packed_seq = torch.cat([past_packed, z], dim=1)
 
         with torch.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
-            x1_hat_full, _ = dyn(
+            x1_hat_full, h_t_full = dyn(
                 actions_in,
                 step_idxs_full,
                 signal_idxs_full,
@@ -148,7 +153,9 @@ def sample_one_timestep_packed(
         b = (x1_hat.float() - z.float()) / denom
         z = (z.float() + b * dt).to(dtype)
 
-    return z[:, 0]  # (B,n_spatial,d_spatial)
+    # h_t from the last denoising step
+    h_t_out = h_t_full[:, -1] if h_t_full is not None else None  # (B, n_agent, d_model)
+    return z[:, 0], h_t_out  # (B,n_spatial,d_spatial), (B,n_agent,d_model)|None
 
 
 def load_task_action_dim(tasks_json: str, task: str, *, default_dim: int = 16) -> int:
@@ -385,6 +392,43 @@ def build_action_from_keys(keys_down: Set[str], *, selected_dim: int, act_dim: i
     return a
 
 
+def load_agent_heads(
+    ckpt_path: str,
+    device: torch.device,
+    d_model: int = 512,
+) -> Tuple[PolicyHead, Optional[RewardHead]]:
+    """Load trained policy (and optionally reward) head from checkpoint.
+
+    Supports both Phase 2 (dynamics+task_emb+policy+reward) and
+    Phase 3 (policy+value) checkpoint formats.
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    action_dim = int(ckpt.get("action_dim", 16))
+    mtp_length = int(ckpt.get("mtp_length", 8))
+
+    # Infer hidden dim from gate_proj weight: shape is (2*hidden, input_dim)
+    gate_w = ckpt["policy"].get("mlp.gate_projs.0.weight")
+    hidden = gate_w.shape[0] // 2 if gate_w is not None else 512
+
+    policy = PolicyHead(d_model=d_model, action_dim=action_dim, hidden=hidden, mtp_length=mtp_length).to(device)
+    policy.load_state_dict(ckpt["policy"])
+    policy.eval()
+    for p in policy.parameters():
+        p.requires_grad_(False)
+
+    reward = None
+    if "reward" in ckpt:
+        rw_gate = ckpt["reward"].get("mlp.gate_projs.0.weight")
+        rw_hidden = rw_gate.shape[0] // 2 if rw_gate is not None else 512
+        reward = RewardHead(d_model=d_model, hidden=rw_hidden, mtp_length=mtp_length).to(device)
+        reward.load_state_dict(ckpt["reward"])
+        reward.eval()
+        for p in reward.parameters():
+            p.requires_grad_(False)
+
+    return policy, reward
+
+
 def load_html(path: Optional[str], *, fallback: str = "") -> str:
     if not path:
         return fallback
@@ -415,6 +459,8 @@ class SessionState:
     a_smooth: torch.Tensor   # (16,)
     ctx_window: int
     fps: float
+
+    autopilot: bool
 
     cached_frame_id: int
     cached_jpeg: Optional[bytes]
@@ -477,6 +523,17 @@ class InteractiveServer:
             mask[:act_dim] = 1.0
         self.act_mask_1d = mask.to(self.device)
 
+        # policy (optional)
+        self.policy: Optional[PolicyHead] = None
+        self.reward_head: Optional[RewardHead] = None
+        self.policy_action_dim: int = 16
+        if args.agent_ckpt and os.path.isfile(args.agent_ckpt):
+            self.policy, self.reward_head = load_agent_heads(
+                args.agent_ckpt, self.device, d_model=self.dyn.d_model,
+            )
+            self.policy_action_dim = self.policy.action_dim
+            print(f"[web] loaded policy from {args.agent_ckpt} (action_dim={self.policy_action_dim})")
+
         # choose episode start + encode initial latent
         self.start_idx = self._choose_start_idx(self.initial_task)
         self.z0_packed = self._encode_initial_latent(self.initial_task, self.start_idx)
@@ -528,6 +585,7 @@ class InteractiveServer:
             a_smooth=a0,
             ctx_window=int(self.args.ctx_window),
             fps=float(self.args.fps),
+            autopilot=self.policy is not None,
             cached_frame_id=-1,
             cached_jpeg=None,
         )
@@ -599,6 +657,32 @@ class InteractiveServer:
         actmask_local = st.act_mask_1d.view(1, 1, 16).expand(1, t + 1, 16).contiguous()
         return past, actions_local, actmask_local
 
+    @torch.inference_mode()
+    def _get_h_t_for_policy(self, st: SessionState) -> torch.Tensor:
+        """Run a clean forward pass on the current context to get h_t for the policy."""
+        import math as _math
+        g = len(st.z_hist)
+        s = max(0, g - int(st.ctx_window))
+        past_list = st.z_hist[s:g]
+        past = torch.stack(past_list, dim=0).unsqueeze(0)  # (1, t, n_spatial, d_spatial)
+        t = past.shape[1]
+
+        emax = int(round(_math.log2(self.k_max)))
+        step_idxs = torch.full((1, t), emax, device=self.device, dtype=torch.long)
+        signal_idxs = torch.full((1, t), self.k_max - 1, device=self.device, dtype=torch.long)
+
+        actions_ctx = torch.zeros((1, t, 16), device=self.device, dtype=torch.float32)
+        if t >= 2:
+            actions_ctx[0, 1:t] = torch.stack(st.a_hist[s + 1: s + t], dim=0)
+        act_mask_ctx = st.act_mask_1d.view(1, 1, 16).expand(1, t, 16)
+
+        _, h_t_full = self.dyn(
+            actions_ctx, step_idxs, signal_idxs, past,
+            act_mask=act_mask_ctx,
+        )
+        # h_t_full: (1, t, n_agent, d_model) — take last timestep, first agent token
+        return h_t_full[:, -1:, 0, :]  # (1, 1, d_model)
+
     def _render_step_sync(self, st: SessionState) -> Tuple[bytes, Dict[str, Any]]:
         """
         Runs at most one WM step (if not paused), then decodes the current frame.
@@ -607,30 +691,38 @@ class InteractiveServer:
         if st.reset_requested:
             self._reset_session(st)
 
-        # action (raw from keys)
-        a_raw = build_action_from_keys(
-            st.keys_down, selected_dim=st.selected_dim, act_dim=st.act_dim, A=16
-        ).to(self.device)
-
-        a_raw = (a_raw.clamp(-1, 1) * st.act_mask_1d).to(torch.float32)
-
-        # EMA smoothing
-        beta = float(st.action_beta)
-        if beta > 0.0:
-            beta = min(max(beta, 0.0), 0.999)
-            st.a_smooth = (beta * st.a_smooth + (1.0 - beta) * a_raw).to(torch.float32)
-            a = st.a_smooth
+        # --- Determine action ---
+        if st.autopilot and self.policy is not None and not st.paused:
+            # Policy-driven: get h_t and sample action
+            h_t = self._get_h_t_for_policy(st)  # (1, 1, d_model)
+            action_raw = self.policy.sample(h_t, step=0)[0, 0]  # (action_dim,)
+            a = torch.zeros(16, device=self.device, dtype=torch.float32)
+            a[:self.policy_action_dim] = action_raw[:self.policy_action_dim].clamp(-1, 1)
+            a = (a * st.act_mask_1d).to(torch.float32)
+            st.last_action_val = float(a[st.selected_dim].item()) if st.act_dim > 0 else 0.0
         else:
-            a = a_raw
+            # Manual keyboard control
+            a_raw = build_action_from_keys(
+                st.keys_down, selected_dim=st.selected_dim, act_dim=st.act_dim, A=16
+            ).to(self.device)
+            a_raw = (a_raw.clamp(-1, 1) * st.act_mask_1d).to(torch.float32)
 
-        st.last_action_val = float(a[st.selected_dim].item()) if st.act_dim > 0 else 0.0
+            beta = float(st.action_beta)
+            if beta > 0.0:
+                beta = min(max(beta, 0.0), 0.999)
+                st.a_smooth = (beta * st.a_smooth + (1.0 - beta) * a_raw).to(torch.float32)
+                a = st.a_smooth
+            else:
+                a = a_raw
+            st.last_action_val = float(a[st.selected_dim].item()) if st.act_dim > 0 else 0.0
 
+        # --- Step the world model ---
         if not st.paused and st.act_dim >= 0:
             st.a_hist.append(a)
 
             past, actions_local, actmask_local = self._build_local_window(st)
 
-            z_next = sample_one_timestep_packed(
+            z_next, _ = sample_one_timestep_packed(
                 self.dyn,
                 past_packed=past,
                 k_max=self.k_max,
@@ -659,19 +751,20 @@ class InteractiveServer:
             st.cached_frame_id = frame_id
             jpeg = st.cached_jpeg
         else:
-            # Frame unchanged. If paused, don't resend bytes; client will keep last image.
-            # If not paused, also don't resend (saves bandwidth in rare "unchanged" cases).
             jpeg = None
 
+        mode = "autopilot" if st.autopilot else "manual"
         status = {
             "type": "status",
             "task": st.task,
             "paused": bool(st.paused),
+            "autopilot": bool(st.autopilot),
+            "has_policy": self.policy is not None,
             "text": (
                 f"step={st.step} | "
                 f"dim={st.selected_dim}/{max(st.act_dim - 1, 0)} | "
                 f"a={st.last_action_val:+.1f} | "
-                f"fps={st.fps:.1f}"
+                f"{mode} | fps={st.fps:.1f}"
             ),
         }
         return jpeg, status
@@ -680,6 +773,7 @@ class InteractiveServer:
         html = self.html
         html = html.replace("__TASK_SET__", json.dumps(self.tasks))
         html = html.replace("__INITIAL_TASK__", self.initial_task)
+        html = html.replace("__HAS_POLICY__", "true" if self.policy is not None else "false")
         return web.Response(text=html, content_type="text/html")
 
     async def ws_handler(self, request: web.Request) -> web.WebSocketResponse:
@@ -719,6 +813,8 @@ class InteractiveServer:
                         st.paused = not st.paused
                     elif k in ("r", "R"):
                         st.reset_requested = True
+                    elif k in ("a", "A"):
+                        st.autopilot = not st.autopilot
                     elif k in ("q", "Q", "Escape"):
                         await ws.close()
                         return
@@ -739,6 +835,9 @@ class InteractiveServer:
 
                 elif t == "reset":
                     st.reset_requested = True
+
+                elif t == "toggle_autopilot":
+                    st.autopilot = not st.autopilot
 
                 elif t == "disconnect":
                     await ws.close()
@@ -789,6 +888,8 @@ def main():
     # checkpoints
     p.add_argument("--tokenizer_ckpt", type=str, default="./logs/tokenizer_ckpts/step_0085000.pt")
     p.add_argument("--dynamics_ckpt", type=str, default="./logs/dynamics_ckpts/latest.pt")
+    p.add_argument("--agent_ckpt", type=str, default=None,
+                   help="Path to agent checkpoint (policy head). Enables autopilot mode.")
 
     # rollout
     p.add_argument("--fps", type=float, default=10.0)
