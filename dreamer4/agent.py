@@ -397,35 +397,6 @@ class RewardHead(nn.Module):
         """Predicted reward (expected value). Returns (B, T) or (B, T, L)."""
         return self.dist(h_t, step).mean
 
-    def loss(self, h_t: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """Average NLL across all MTP steps that have targets.
-
-        Args:
-            h_t: (B, T, d_model)
-            targets: (B, T) rewards — loss is computed for MTP steps 0..min(L, T)-1
-
-        Returns:
-            scalar loss
-        """
-        logits = self.forward(h_t)  # (B, T, L, num_bins)
-        B, T, L, _ = logits.shape
-
-        total_loss = torch.tensor(0.0, device=h_t.device)
-        count = 0
-        for l in range(L):
-            # For MTP step l, target at time t is reward at t+l+1
-            # But targets are already aligned: targets[:, t] = reward for transition at t
-            # So for step l, we shift: target is targets[:, t+l] for input h_t[:, t]
-            valid_T = T - l
-            if valid_T <= 0:
-                break
-            dist_l = TwoHotDist(logits[:, :valid_T, l], low=self.low, high=self.high)
-            target_l = targets[:, l:l + valid_T]
-            nll = -dist_l.log_prob(target_l)  # (B, valid_T)
-            total_loss = total_loss + nll.mean()
-            count += 1
-
-        return total_loss / max(count, 1)
 
 
 # ---------------------------------------------------------------------------

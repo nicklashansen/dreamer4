@@ -40,7 +40,7 @@ from model import (
     Encoder, Decoder, Tokenizer, Dynamics, TaskEmbedder,
     temporal_patchify, pack_bottleneck_to_spatial,
 )
-from agent import PolicyHead, RewardHead, TanhNormal
+from agent import PolicyHead, RewardHead, TanhNormal, TwoHotDist
 from train_dynamics import (
     get_dist_info, is_rank0, seed_everything, worker_init_fn,
     init_distributed, load_frozen_tokenizer_from_pt_ckpt,
@@ -248,6 +248,8 @@ def bc_loss(
         loss: scalar
         aux: dict
     """
+
+    # only one forward pass for the l tokens
     mu, std = policy(h_t)  # (B, T, L, A)
     B, T, L, A = mu.shape
 
@@ -288,6 +290,8 @@ def reward_loss(
 ) -> tuple:
     """Reward prediction loss: two-hot CE of dataset rewards.
 
+    MTP: for step l, predict reward at t+l from h_t at time t.
+
     Args:
         h_t: (B, T, d_model) — detached agent token outputs
         rewards: (B, T) — dataset rewards
@@ -296,7 +300,25 @@ def reward_loss(
         loss: scalar
         aux: dict
     """
-    loss = reward_head.loss(h_t, rewards)
+    logits = reward_head(h_t)  # (B, T, L, num_bins)
+    B, T, L, _ = logits.shape
+
+    total_nll = torch.tensor(0.0, device=h_t.device)
+    count = 0
+    for l in range(L):
+        # For MTP step l, target at time t is reward at t+l+1
+        # But targets are already aligned: targets[:, t] = reward for transition at t
+        # So for step l, we shift: target is targets[:, t+l] for input h_t[:, t]
+        valid_T = T - l
+        if valid_T <= 0:
+            break
+        dist_l = TwoHotDist(logits[:, :valid_T, l], low=reward_head.low, high=reward_head.high)
+        target_l = rewards[:, l:l + valid_T]
+        nll = -dist_l.log_prob(target_l)  # (B, valid_T)
+        total_nll = total_nll + nll.mean()
+        count += 1
+
+    loss = total_nll / max(count, 1)
     pred = reward_head.predict(h_t, step=0)
     aux = {
         "reward_ce": loss.detach(),
@@ -527,7 +549,7 @@ def run_bc_eval(
             break
         target = act[:, l:l + valid_T, :A].clamp(-1, 1)
         mask_l = act_mask[:, l:l + valid_T, :A]
-        dist_l = TanhNormal(mu[:, :valid_T, l, :A], std[:, :valid_T, l, :A])
+        dist_l = TanhNormal(mu[:, :valid_T, l, :A], std[:, :valid_T, l, :A]) # gets masked right after
         per_dim = dist_l.log_prob_per_dim(target)
         nll = -(per_dim * mask_l).sum(dim=-1) / mask_l.sum(dim=-1).clamp(min=1)
         nll_steps.append(nll.clamp(max=50.0))  # (B, valid_T)
