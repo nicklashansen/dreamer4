@@ -44,7 +44,7 @@ from agent import PolicyHead, RewardHead, TanhNormal
 from train_dynamics import (
     get_dist_info, is_rank0, seed_everything, worker_init_fn,
     init_distributed, load_frozen_tokenizer_from_pt_ckpt,
-    dynamics_pretrain_loss,
+    dynamics_pretrain_loss, make_tau_schedule, run_dynamics_eval,
 )
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -307,6 +307,307 @@ def reward_loss(
 
 
 # ---------------------------------------------------------------------------
+# BC eval (clean forward pass, wandb logging)
+# ---------------------------------------------------------------------------
+
+
+def log_bc_eval_wandb(
+    *,
+    frames: torch.Tensor,       # (B, T, C, H, W) float [0,1]
+    mu: torch.Tensor,           # (B, T, L, A) policy mean (pre-tanh)
+    act: torch.Tensor,          # (B, T, 16) ground-truth actions
+    act_mask: torch.Tensor,     # (B, T, 16)
+    reward_pred: torch.Tensor,  # (B, T)
+    rewards: torch.Tensor,      # (B, T)
+    step: int,
+    tag: str = "bc_eval",
+    max_items: int = 4,
+    bar_h: int = 8,
+    gap_px: int = 4,
+):
+    """Log a visual panel to wandb: frame strip + action prediction bars.
+
+    For each example in the batch (up to max_items):
+      Row 1: GT frames tiled across time
+      Row 2: Predicted action dims (policy mean, l=0, clamped to [-1,1]) as
+             a color bar per timestep — blue=−1, white=0, red=+1
+      Row 3: GT action dims, same coloring
+      Row 4: Absolute error |pred - gt| — white=0, red=1
+      Row 5: Reward predicted (red) vs GT (blue) as a thin color bar
+
+    The panel is logged as a single wandb.Image per batch item.
+    """
+    B, T, C, H, W = frames.shape
+    Bv = min(B, max_items)
+    A_full = act.shape[2]
+    # number of action dims actually used (from mask first row)
+    n_act = int(act_mask[0, 0].sum().long().clamp(min=1, max=A_full).item())
+
+    action_pred = mu[:Bv, :, 0, :n_act].tanh().float().cpu()  # (Bv, T, n_act)
+    action_gt = act[:Bv, :, :n_act].clamp(-1, 1).float().cpu()  # (Bv, T, n_act)
+    act_err = (action_pred - action_gt).abs()                    # (Bv, T, n_act)
+    r_pred = reward_pred[:Bv].float().cpu()  # (Bv, T)
+    r_gt = rewards[:Bv].float().cpu()        # (Bv, T)
+
+    def _action_to_rgb(x: torch.Tensor) -> torch.Tensor:
+        """x: (...) in [-1,1] -> (..., 3) uint8. Blue=-1, White=0, Red=+1."""
+        x = x.clamp(-1, 1)
+        pos = x.clamp(0, 1)
+        neg = (-x).clamp(0, 1)
+        r = (1.0 - neg).clamp(0, 1)
+        g = (1.0 - pos - neg).clamp(0, 1)
+        b = (1.0 - pos).clamp(0, 1)
+        return (torch.stack([r, g, b], dim=-1) * 255).to(torch.uint8)
+
+    def _err_to_rgb(x: torch.Tensor) -> torch.Tensor:
+        """x: (...) in [0,1] -> (..., 3) uint8. White=0, Red=1."""
+        x = x.clamp(0, 1)
+        r = torch.ones_like(x)
+        g = (1.0 - x)
+        b = (1.0 - x)
+        return (torch.stack([r, g, b], dim=-1) * 255).to(torch.uint8)
+
+    def _reward_bar(r: torch.Tensor, color: tuple, h: int, W_: int) -> torch.Tensor:
+        """r: (T,) scalar reward -> (h, W_, 3) uint8 color strip, intensity ~ |r|."""
+        r_norm = r.clamp(-1, 1) * 0.5 + 0.5  # [0,1]
+        strip = torch.zeros(h, W_, 3, dtype=torch.uint8)
+        col = torch.tensor(color, dtype=torch.float32)
+        for t in range(T):
+            x0 = t * (W_ // T)
+            x1 = (t + 1) * (W_ // T) if t < T - 1 else W_
+            strip[:, x0:x1] = (col * float(r_norm[t])).to(torch.uint8)
+        return strip
+
+    panels = []
+    for i in range(Bv):
+        # --- Frame strip: (C, H, T*W) ---
+        fr = (frames[i].float().cpu().clamp(0, 1) * 255).to(torch.uint8)  # (T,C,H,W)
+        frame_strip = fr.permute(1, 2, 0, 3).reshape(C, H, T * W)  # (C, H, T*W)
+        panel_W = T * W
+
+        # --- Action bars: each action dim becomes bar_h rows ---
+        # pred: (n_act, T) -> (n_act, bar_h, T, 3)
+        pred_rgb = _action_to_rgb(action_pred[i].T)  # (n_act, T, 3)
+        gt_rgb = _action_to_rgb(action_gt[i].T)       # (n_act, T, 3)
+        err_rgb = _err_to_rgb(act_err[i].T)            # (n_act, T, 3)
+
+        def _expand_bar(x_rgb, bar_h_, W_):
+            # x_rgb: (n_act, T, 3) -> (3, n_act*bar_h_, W_)
+            n = x_rgb.shape[0]
+            out = torch.zeros(3, n * bar_h_, W_, dtype=torch.uint8)
+            for d in range(n):
+                col = x_rgb[d]  # (T, 3)
+                for t in range(T):
+                    x0 = t * (W_ // T)
+                    x1 = (t + 1) * (W_ // T) if t < T - 1 else W_
+                    for c in range(3):
+                        out[c, d * bar_h_:(d + 1) * bar_h_, x0:x1] = col[t, c]
+            return out
+
+        pred_bar = _expand_bar(pred_rgb, bar_h, panel_W)
+        gt_bar = _expand_bar(gt_rgb, bar_h, panel_W)
+        err_bar = _expand_bar(err_rgb, bar_h, panel_W)
+
+        # Reward strips (red = predicted, blue = gt)
+        r_pred_strip = _reward_bar(r_pred[i], (255, 80, 80), bar_h, panel_W)   # red
+        r_gt_strip = _reward_bar(r_gt[i], (80, 80, 255), bar_h, panel_W)        # blue
+        r_pred_strip = r_pred_strip.permute(2, 0, 1)  # (3, bar_h, panel_W)
+        r_gt_strip = r_gt_strip.permute(2, 0, 1)
+
+        gap = torch.zeros(3, gap_px, panel_W, dtype=torch.uint8)
+
+        # Stack: frame | gap | pred_actions | gap | gt_actions | gap | err | gap | rew_pred | rew_gt
+        rows = [frame_strip, gap, pred_bar, gap, gt_bar, gap, err_bar, gap, r_pred_strip, r_gt_strip]
+        panel_img = torch.cat(rows, dim=1)  # (3, total_H, panel_W)
+        panels.append(panel_img)
+
+    # Stack all examples vertically
+    big = torch.cat(panels, dim=1)  # (3, Bv*total_H, panel_W)
+    big_hwc = big.permute(1, 2, 0).numpy()
+
+    wandb.log(
+        {
+            f"{tag}/viz": wandb.Image(
+                big_hwc,
+                caption=(
+                    f"rows per example: frames | pred_actions | gt_actions | err | rew_pred(red) rew_gt(blue)"
+                    f" | ctx=all T={T} A={n_act}"
+                ),
+            )
+        },
+        step=step,
+    )
+
+
+@torch.no_grad()
+def run_bc_eval(
+    *,
+    encoder: Encoder,
+    dyn,
+    task_embedder: TaskEmbedder,
+    policy: PolicyHead,
+    reward_head: RewardHead,
+    frames: torch.Tensor,   # (B, T, C, H, W) float [0,1]
+    act: torch.Tensor,      # (B, T, 16) raw actions (unshifted)
+    act_mask: torch.Tensor, # (B, T, 16)
+    rewards: torch.Tensor,  # (B, T)
+    emb_ids: torch.Tensor,  # (B,)
+    task_ids: torch.Tensor, # (B,)
+    n_spatial: int,
+    packing_factor: int,
+    patch: int,
+    k_max: int,
+    action_dim: int,
+    mtp_length: int,
+    step: int,
+    task_names: Optional[list] = None,
+    tag: str = "bc_eval",
+):
+    """Evaluate BC and reward heads via a clean (noise-free) dynamics forward pass.
+
+    Unlike training (which uses noisy diffusion inputs), we run at the finest
+    step (emax) with clean signal (sigma_idx = k_max-1) on ground-truth latents.
+    This gives h_t that matches what the policy sees during actual rollout, so
+    the BC metrics are not confounded by noise corruption.
+
+    Logs to wandb:
+      bc_eval/bc_nll              -- mean NLL across MTP steps
+      bc_eval/bc_mean_std         -- mean policy std (lower = more confident)
+      bc_eval/action_mae          -- |policy_mean - target| for valid dims
+      bc_eval/reward_mse          -- MSE predicted vs actual rewards
+      bc_eval/reward_mae          -- MAE predicted vs actual rewards
+      bc_eval/reward_corr         -- Pearson r(predicted, actual)
+      bc_eval/reward_pred_mean
+      bc_eval/reward_target_mean
+      bc_eval/task_<name>/bc_nll  -- per-task NLL breakdown
+    """
+    device = frames.device
+    B, T = frames.shape[:2]
+
+    was_training = {
+        "dyn": dyn.training,
+        "te": task_embedder.training,
+        "pi": policy.training,
+        "rw": reward_head.training,
+    }
+    dyn.eval(); task_embedder.eval(); policy.eval(); reward_head.eval()
+
+    # Encode frames (encoder is always frozen/eval)
+    patches = temporal_patchify(frames, patch)
+    z_btLd, _ = encoder(patches)
+    z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=packing_factor)  # (B,T,Sz,Dz)
+
+    agent_tokens = task_embedder(emb_ids, B=B, T=T)  # (B, T, n_agent, d_model)
+
+    # Clean dynamics forward: finest step + clean signal, no noise
+    emax = int(round(math.log2(k_max)))
+    step_idxs = torch.full((B, T), emax, device=device, dtype=torch.long)
+    signal_idxs = torch.full((B, T), k_max - 1, device=device, dtype=torch.long)
+
+    # Shift actions (first timestep = zeros), same convention as training
+    actions_shifted = torch.zeros_like(act)
+    actions_shifted[:, 1:] = act[:, :-1]
+    mask_shifted = torch.zeros_like(act_mask)
+    mask_shifted[:, 1:] = act_mask[:, :-1]
+
+    _, h_t_full = dyn(
+        actions_shifted, step_idxs, signal_idxs, z1,
+        act_mask=mask_shifted, agent_tokens=agent_tokens,
+    )
+    h_pooled = h_t_full.mean(dim=2)  # (B, T, d_model)
+
+    # BC NLL
+    mu, std = policy(h_pooled)  # (B, T, L, A)
+    L_mtp, A = mu.shape[2], mu.shape[3]
+
+    nll_steps = []
+    for l in range(min(L_mtp, mtp_length)):
+        valid_T = T - l
+        if valid_T <= 0:
+            break
+        target = act[:, l:l + valid_T, :A].clamp(-1, 1)
+        mask_l = act_mask[:, l:l + valid_T, :A]
+        dist_l = TanhNormal(mu[:, :valid_T, l, :A], std[:, :valid_T, l, :A])
+        per_dim = dist_l.log_prob_per_dim(target)
+        nll = -(per_dim * mask_l).sum(dim=-1) / mask_l.sum(dim=-1).clamp(min=1)
+        nll_steps.append(nll.clamp(max=50.0))  # (B, valid_T)
+
+    if nll_steps:
+        nll_per_sample = torch.stack([s.mean(dim=1) for s in nll_steps]).mean(dim=0)  # (B,)
+        bc_nll_mean = float(nll_per_sample.mean().item())
+    else:
+        nll_per_sample = torch.zeros(B, device=device)
+        bc_nll_mean = 0.0
+
+    bc_std_mean = float(std[..., :action_dim].mean().item())
+
+    # Action MAE: policy mean (l=0) vs target
+    action_pred = mu[:, :, 0, :action_dim].tanh()
+    action_tgt = act[:, :, :action_dim].clamp(-1, 1)
+    action_msk = act_mask[:, :, :action_dim]
+    action_mae = float(
+        ((action_pred - action_tgt).abs() * action_msk).sum() / action_msk.sum().clamp(min=1)
+    )
+
+    # Reward quality
+    reward_pred = reward_head.predict(h_pooled, step=0)  # (B, T)
+    reward_mse = float((reward_pred - rewards).pow(2).mean().item())
+    reward_mae_val = float((reward_pred - rewards).abs().mean().item())
+    rp, rt = reward_pred.flatten(), rewards.flatten()
+    reward_corr = float(torch.corrcoef(torch.stack([rp, rt]))[0, 1].item()) \
+        if rp.std() > 1e-6 and rt.std() > 1e-6 else 0.0
+
+    # Per-task NLL breakdown
+    per_task_logs = {}
+    if task_names is not None:
+        for tid in task_ids.unique():
+            mask_b = task_ids == tid
+            tid_int = int(tid.item())
+            tname = task_names[tid_int] if tid_int < len(task_names) else f"task_{tid_int}"
+            per_task_logs[f"{tag}/task_{tname}/bc_nll"] = float(nll_per_sample[mask_b].mean().item())
+
+    log_dict = {
+        f"{tag}/bc_nll":             bc_nll_mean,
+        f"{tag}/bc_mean_std":        bc_std_mean,
+        f"{tag}/action_mae":         action_mae,
+        f"{tag}/reward_mse":         reward_mse,
+        f"{tag}/reward_mae":         reward_mae_val,
+        f"{tag}/reward_corr":        reward_corr,
+        f"{tag}/reward_pred_mean":   float(reward_pred.mean().item()),
+        f"{tag}/reward_target_mean": float(rewards.mean().item()),
+    }
+    log_dict.update(per_task_logs)
+    wandb.log(log_dict, step=step)
+
+    print(
+        f"[bc_eval step {step:07d}] "
+        f"bc_nll={bc_nll_mean:.4f} "
+        f"bc_std={bc_std_mean:.3f} "
+        f"act_mae={action_mae:.4f} "
+        f"rew_mse={reward_mse:.5f} "
+        f"rew_corr={reward_corr:.3f}"
+    )
+
+    # Visual panel: frame strip + action prediction heatmap
+    log_bc_eval_wandb(
+        frames=frames,
+        mu=mu,
+        act=act,
+        act_mask=act_mask,
+        reward_pred=reward_pred,
+        rewards=rewards,
+        step=step,
+        tag=tag,
+        max_items=4,
+    )
+
+    if was_training["dyn"]: dyn.train()
+    if was_training["te"]:  task_embedder.train()
+    if was_training["pi"]:  policy.train()
+    if was_training["rw"]:  reward_head.train()
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
@@ -457,6 +758,9 @@ def train(args):
         print(f"Parameters: dynamics={dyn_params:,} task_emb={te_params:,} policy={pi_params:,} reward={rw_params:,}")
         print(f"Total trainable: {dyn_params + te_params + pi_params + rw_params:,}")
 
+    if args.compile:
+        dyn = torch.compile(dyn)
+    
     # --- DDP ---
     if ddp:
         dyn = torch.nn.parallel.DistributedDataParallel(
@@ -688,6 +992,51 @@ def train(args):
                         "time/hrs": elapsed,
                     }, step=step)
 
+                # --- BC eval + dynamics visual eval ---
+                if is_rank0() and args.eval_every > 0 and (step % args.eval_every == 0):
+                    B_ev = min(B, args.eval_batch_size)
+                    run_bc_eval(
+                        encoder=encoder,
+                        dyn=dyn.module if hasattr(dyn, "module") else dyn,
+                        task_embedder=task_embedder,
+                        policy=policy,
+                        reward_head=reward_head,
+                        frames=frames[:B_ev],
+                        act=act[:B_ev],
+                        act_mask=mask[:B_ev],
+                        rewards=rew[:B_ev],
+                        emb_ids=emb_id[:B_ev],
+                        task_ids=task_id[:B_ev],
+                        n_spatial=n_spatial,
+                        packing_factor=args.packing_factor,
+                        patch=patch,
+                        k_max=k_max,
+                        action_dim=args.action_dim,
+                        mtp_length=args.mtp_length,
+                        step=step,
+                        task_names=list(dataset.tasks),
+                    )
+                    # Dynamics visual eval: autoregressive rollout + GT/Pred frame panel
+                    sched = make_tau_schedule(
+                        k_max=k_max, schedule=args.eval_schedule, d=args.eval_d
+                    )
+                    run_dynamics_eval(
+                        encoder=encoder,
+                        decoder=decoder,
+                        dyn=dyn.module if hasattr(dyn, "module") else dyn,
+                        frames=frames[:B_ev],
+                        actions=actions[:B_ev],
+                        act_mask=act_mask_shifted[:B_ev],
+                        H=H, W=W, C=C, patch=patch,
+                        packing_factor=args.packing_factor,
+                        k_max=k_max,
+                        ctx_length=args.eval_ctx,
+                        horizon=args.eval_horizon,
+                        sched=sched,
+                        max_items=args.eval_batch_size,
+                        step=step,
+                    )
+
                 if is_rank0():
                     elapsed = (time.time() - t0) / 3600.0
                     spike_msg = diag_hook.maybe_record(
@@ -772,7 +1121,7 @@ if __name__ == "__main__":
     p.add_argument("--tasks_json", type=str, default="../tasks.json")
     p.add_argument("--seq_len", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)
-    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--batch_size", type=int, default=24)
     p.add_argument("--tasks", type=str, nargs="+", default=None,
                    help="Task subset. Default: all 30 TASK_SET tasks.")
 
@@ -814,7 +1163,7 @@ if __name__ == "__main__":
     p.add_argument("--w_bc", type=float, default=1.0)
     p.add_argument("--w_reward", type=float, default=1.0)
 
-    # Optimization
+    # optim
     p.add_argument("--lr", type=float, default=1e-4, help="LR for heads + task embedder")
     p.add_argument("--lr_dynamics", type=float, default=1e-4, help="LR for dynamics (lower, since pre-trained)")
     p.add_argument("--weight_decay", type=float, default=1e-2)
@@ -822,19 +1171,36 @@ if __name__ == "__main__":
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--grad_clip", type=float, default=1.0)
 
-    # Logging
-    p.add_argument("--log_every", type=int, default=100)
-    p.add_argument("--wandb_project", type=str, default="dreamer4-agent")
-    p.add_argument("--wandb_run_name", type=str, default="phase2")
-    p.add_argument("--wandb_entity", type=str, default=None)
+    # eval / viz
+    p.add_argument("--eval_every", type=int, default=1_000,
+                   help="Run BC + dynamics eval every N steps. 0 to disable.")
+    p.add_argument("--eval_batch_size", type=int, default=8,
+                   help="Batch size for eval (subset of training batch).")
+    p.add_argument("--eval_ctx", type=int, default=8,
+                   help="Context length for dynamics autoregressive eval.")
+    p.add_argument("--eval_horizon", type=int, default=16,
+                   help="Prediction horizon for dynamics autoregressive eval.")
+    p.add_argument("--eval_schedule", type=str, default="shortcut", choices=["finest", "shortcut"],
+                   help="Denoising schedule for dynamics eval rollout.")
+    p.add_argument("--eval_d", type=float, default=0.25,
+                   help="Step size d for shortcut schedule during eval.")
 
-    # Checkpointing
+    # logging
+    p.add_argument("--log_every", type=int, default=100)
+
+    # wandb
+    p.add_argument("--wandb_project", type=str, default="Dreamer 4 Continuous Control")
+    p.add_argument("--wandb_run_name", type=str, default="default")
+    p.add_argument("--wandb_entity", type=str, default="eqforcing")
+
+    # ckpt
     p.add_argument("--ckpt_dir", type=str, default="./logs/agent_ckpts")
     p.add_argument("--save_every", type=int, default=5_000)
     p.add_argument("--resume", type=str, default=None)
 
-    # Misc
+    # misc
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--compile", action="store_true")
 
     # Diagnostics
     p.add_argument("--diag_enable", action="store_true",
