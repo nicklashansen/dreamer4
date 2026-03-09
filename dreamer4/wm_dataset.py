@@ -128,6 +128,7 @@ class WMDataset(Dataset):
         self.demo_paths = []     # kept for compatibility/debug; now stores list of per-task demo paths (joined)
         self.shard_lists = []    # NOW: per task -> list[segments], each segment is list[shard_paths]
         self.seg_cum_frames = [] # per task -> cumulative frame counts across segments (for indexing)
+        self.seg_source_ids = [] # per task -> source idx for each segment
 
         self.ep = []
         self.act = []
@@ -150,10 +151,11 @@ class WMDataset(Dataset):
             seg_shards = []
             seg_num_frames = []
             seg_demo_paths = []
+            seg_source_ids = []
 
             ep_offset = 0  # ensures episode ids are unique across segments
 
-            for (dd, fd) in self.sources:
+            for src_idx, (dd, fd) in enumerate(self.sources):
                 dp = os.path.join(dd, f"{task}.pt")
                 shard_glob = os.path.join(fd, task, "*shard*.pt")
                 shards = sorted(glob.glob(shard_glob))
@@ -226,6 +228,7 @@ class WMDataset(Dataset):
                 seg_shards.append(shards)
                 seg_num_frames.append(int(N_eff))
                 seg_demo_paths.append(dp)
+                seg_source_ids.append(int(src_idx))
 
             if len(seg_eps) == 0:
                 if self.verbose:
@@ -309,6 +312,7 @@ class WMDataset(Dataset):
                 s += int(nf)
                 cum.append(s)
             self.seg_cum_frames.append(cum)
+            self.seg_source_ids.append(seg_source_ids)
 
             self.ep.append(ep)
             self.act.append(act)
@@ -435,6 +439,9 @@ class WMDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         task_idx, start = self._lookup(int(idx))
+        seg_idx = bisect.bisect_right(self.seg_cum_frames[task_idx], int(start))
+        source_id = self.seg_source_ids[task_idx][seg_idx]
+        ep_id = int(self.ep[task_idx][start].item())
 
         obs = self._get_frames(task_idx, start, self.T + 1)  # (T+1,3,H,W) uint8
 
@@ -456,6 +463,12 @@ class WMDataset(Dataset):
             "rew": rew,
             "lang_emb": self._lang_embs[task_idx],
             "emb_id": self._emb_ids[task_idx],
+            "task_id": torch.tensor(task_idx, dtype=torch.long),
+            "source_id": torch.tensor(source_id, dtype=torch.long),
+            "segment_idx": torch.tensor(seg_idx, dtype=torch.long),
+            "window_start": torch.tensor(start, dtype=torch.long),
+            "episode_id": torch.tensor(ep_id, dtype=torch.long),
+            "sample_idx": torch.tensor(int(idx), dtype=torch.long),
         }
 
 

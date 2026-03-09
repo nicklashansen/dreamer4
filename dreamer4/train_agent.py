@@ -25,6 +25,8 @@ import argparse
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+import wandb
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -33,6 +35,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from task_set import TASK_SET
 from wm_dataset import WMDataset, collate_batch
+from agent_diagnostics import AgentDiagnosticsHook, DiagnosticsConfig
 from model import (
     Encoder, Decoder, Tokenizer, Dynamics, TaskEmbedder,
     temporal_patchify, pack_bottleneck_to_spatial,
@@ -47,10 +50,6 @@ from train_dynamics import (
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-
-# ---------------------------------------------------------------------------
-# Checkpoint save / load
-# ---------------------------------------------------------------------------
 
 def save_ckpt(
     path: Path,
@@ -112,31 +111,68 @@ def load_pretrained_dynamics(
     d_bottleneck: int,
     n_latents: int,
     packing_factor: int,
-    space_mode_override: Optional[str] = None,
+    override: Optional[Dict[str, Any]] = None
 ) -> tuple:
     """Load pre-trained dynamics and return model + info dict.
-
-    Args:
-        space_mode_override: if set, override the checkpoint's space_mode.
-            Use "wm_agent" for Phase 2/3 so agent tokens attend to actions/state.
     """
+    override = override or {}
     ckpt = torch.load(ckpt_path, map_location="cpu")
     a = ckpt.get("args", {}) or {}
 
-    d_model = int(a.get("d_model_dyn", 512))
-    n_heads = int(a.get("n_heads", 4))
-    depth = int(a.get("dyn_depth", 8))
-    dropout = float(a.get("dropout", 0.0))
-    mlp_ratio = float(a.get("mlp_ratio", 4.0))
-    time_every = int(a.get("time_every", 1))
-    k_max = int(a.get("k_max", 8))
-    n_register = int(a.get("n_register", 4))
-    n_agent = int(a.get("n_agent", 1))
-    space_mode = space_mode_override or str(a.get("space_mode", "wm_agent_isolated"))
+    def _resolved_int(name: str, default: int) -> int:
+        return int(override.get(name, a.get(name, default)))
 
-    assert n_latents % packing_factor == 0
+    def _resolved_float(name: str, default: float) -> float:
+        return float(override.get(name, a.get(name, default)))
+
+    def _resolved_str(name: str, default: str) -> str:
+        return str(override.get(name, a.get(name, default)))
+
+    d_model = _resolved_int("d_model_dyn", 512)
+    n_heads = _resolved_int("n_heads", 4)
+    depth = _resolved_int("dyn_depth", 8)
+    dropout = _resolved_float("dropout", 0.0)
+    mlp_ratio = _resolved_float("mlp_ratio", 4.0)
+    time_every = _resolved_int("time_every", 1)
+    k_max = _resolved_int("k_max", 8)
+    n_register = _resolved_int("n_register", 4)
+    n_agent = _resolved_int("n_agent", 1)
+    space_mode = _resolved_str("space_mode", "wm_agent")
+
+    if n_latents % packing_factor != 0:
+        raise ValueError(
+            f"Incompatible tokenizer/dynamics packing: n_latents={n_latents} "
+            f"is not divisible by packing_factor={packing_factor}."
+        )
     n_spatial = n_latents // packing_factor
     d_spatial = d_bottleneck * packing_factor
+
+    # Optional metadata checks from the dynamics checkpoint.
+    if a.get("n_latents") is not None and int(a["n_latents"]) != int(n_latents):
+        raise ValueError(
+            f"Tokenizer/dynamics mismatch: tokenizer n_latents={n_latents}, "
+            f"but dynamics ckpt expects n_latents={int(a['n_latents'])}."
+        )
+    if a.get("d_bottleneck") is not None and int(a["d_bottleneck"]) != int(d_bottleneck):
+        raise ValueError(
+            f"Tokenizer/dynamics mismatch: tokenizer d_bottleneck={d_bottleneck}, "
+            f"but dynamics ckpt expects d_bottleneck={int(a['d_bottleneck'])}."
+        )
+    if a.get("packing_factor") is not None and int(a["packing_factor"]) != int(packing_factor):
+        raise ValueError(
+            f"Runtime/dynamics mismatch: packing_factor={packing_factor}, "
+            f"but dynamics ckpt was trained with packing_factor={int(a['packing_factor'])}."
+        )
+    if a.get("n_spatial") is not None and int(a["n_spatial"]) != int(n_spatial):
+        raise ValueError(
+            f"Derived/ckpt mismatch: n_spatial={n_spatial}, "
+            f"but dynamics ckpt metadata has n_spatial={int(a['n_spatial'])}."
+        )
+    if a.get("d_spatial") is not None and int(a["d_spatial"]) != int(d_spatial):
+        raise ValueError(
+            f"Derived/ckpt mismatch: d_spatial={d_spatial}, "
+            f"but dynamics ckpt metadata has d_spatial={int(a['d_spatial'])}."
+        )
 
     dyn = Dynamics(
         d_model=d_model,
@@ -168,6 +204,14 @@ def load_pretrained_dynamics(
         "n_spatial": n_spatial,
         "d_spatial": d_spatial,
         "n_agent": n_agent,
+        "n_heads": n_heads,
+        "dyn_depth": depth,
+        "dropout": dropout,
+        "mlp_ratio": mlp_ratio,
+        "time_every": time_every,
+        "n_register": n_register,
+        "space_mode": space_mode,
+        "ckpt_args": a,
     }
     return dyn, info
 
@@ -188,6 +232,10 @@ def bc_loss(
 
     MTP: for step l, predict action at t+l+1 from h_t at time t.
     Per-dim log probs are masked so padding dimensions don't contribute.
+
+    If mask_l[..., j] = 0 for an invalid action dimension, the coordinate
+    does not contribute to the loss. We also normalize losses by the number 
+    of valid action dimensions 
 
     Args:
         h_t: (B, T, d_model)
@@ -217,6 +265,11 @@ def bc_loss(
         per_dim = dist_l.log_prob_per_dim(target)  # (B, valid_T, A)
         masked = per_dim * mask_l
         nll = -masked.sum(dim=-1) / mask_l.sum(dim=-1).clamp(min=1)
+        # Per-timestep NLL cap: prevents individual catastrophic samples
+        # (e.g. random-policy mixed-large actions) from exploding the batch mean.
+        # 50 nats ≈ chance-level for a 6-dim bounded action; anything higher
+        # gives zero useful gradient signal.
+        nll = nll.clamp(max=50.0)
         total_nll = total_nll + nll.mean()
         count += 1
 
@@ -287,29 +340,89 @@ def train(args):
         collate_fn=collate_batch,
     )
 
-    # --- Frozen tokenizer ---
+    # Load frozen tokenizer
+    tok_override = {}
+    if args.H is not None: tok_override["H"] = args.H
+    if args.W is not None: tok_override["W"] = args.W
+    if args.C is not None: tok_override["C"] = args.C
+    if args.patch is not None: tok_override["patch"] = args.patch
     encoder, decoder, tok_args = load_frozen_tokenizer_from_pt_ckpt(
-        args.tokenizer_ckpt, device=device,
+        args.tokenizer_ckpt, device=device, override=(tok_override or None),
     )
-    H = int(tok_args.get("H", 128))
-    W = int(tok_args.get("W", 128))
-    C = int(tok_args.get("C", 3))
-    patch = int(tok_args.get("patch", 4))
-    n_latents = int(tok_args.get("n_latents", 16))
-    d_bottleneck = int(tok_args.get("d_bottleneck", 32))
 
-    n_spatial = n_latents // args.packing_factor
+    H_tokenizer = int(tok_args.get("H", 128))
+    W_tokenizer = int(tok_args.get("W", 128))
+    C_tokenizer = int(tok_args.get("C", 3))
+    patch_tokenizer = int(tok_args.get("patch", 4))
+    n_latents_tokenizer = int(tok_args.get("n_latents", 16))
+    d_bottleneck = int(tok_args.get("d_bottleneck", 32))
+    H, W, C, patch = H_tokenizer, W_tokenizer, C_tokenizer, patch_tokenizer
+
+    if n_latents_tokenizer % args.packing_factor != 0:
+        raise ValueError(
+            f"Incompatible tokenizer/packing: n_latents={n_latents_tokenizer} "
+            f"is not divisible by packing_factor={args.packing_factor}."
+        )
+    n_spatial = n_latents_tokenizer // args.packing_factor
     d_spatial = d_bottleneck * args.packing_factor
 
-    # --- Load pre-trained dynamics (trainable) ---
+    # Load pretrained dynamics model
+    dyn_override = {}
+    dyn_override["d_model_dyn"] = args.d_model_dyn
+    dyn_override["dyn_depth"] = args.dyn_depth
+    dyn_override["n_heads"] = args.n_heads
+    dyn_override["dropout"] = args.dropout
+    dyn_override["mlp_ratio"] = args.mlp_ratio
+    dyn_override["time_every"] = args.time_every
+    dyn_override["k_max"] = args.k_max
+    dyn_override["n_register"] = args.n_register
+    dyn_override["n_agent"] = args.n_agent
+    if args.space_mode is not None: dyn_override["space_mode"] = args.space_mode
+    
     dyn, dyn_info = load_pretrained_dynamics(
         args.dynamics_ckpt,
         device=device,
         d_bottleneck=d_bottleneck,
-        n_latents=n_latents,
+        n_latents=n_latents_tokenizer,
         packing_factor=args.packing_factor,
-        space_mode_override=args.space_mode,
+        override=dyn_override
     )
+    dyn_ckpt_args = dyn_info.get("ckpt_args", {}) or {}
+    for name, tok_val in (
+        ("H", H_tokenizer),
+        ("W", W_tokenizer),
+        ("C", C_tokenizer),
+        ("patch", patch_tokenizer),
+        ("n_latents", n_latents_tokenizer),
+        ("d_bottleneck", d_bottleneck),
+        ("packing_factor", int(args.packing_factor)),
+        ("n_spatial", n_spatial),
+        ("d_spatial", d_spatial),
+    ):
+        if dyn_ckpt_args.get(name) is not None and int(dyn_ckpt_args[name]) != int(tok_val):
+            raise ValueError(
+                f"Tokenizer/dynamics mismatch for {name}: tokenizer/runtime={tok_val}, "
+                f"dynamics ckpt={int(dyn_ckpt_args[name])}."
+            )
+
+    runtime_vs_loaded = (
+        ("d_model_dyn", args.d_model_dyn, dyn_info["d_model"]),
+        ("k_max", args.k_max, dyn_info["k_max"]),
+        ("n_agent", args.n_agent, dyn_info["n_agent"]),
+        ("n_heads", args.n_heads, dyn_info["n_heads"]),
+        ("dyn_depth", args.dyn_depth, dyn_info["dyn_depth"]),
+        ("n_register", args.n_register, dyn_info["n_register"]),
+    )
+    for name, expected, loaded in runtime_vs_loaded:
+        if int(expected) != int(loaded):
+            raise ValueError(
+                f"Args/dynamics mismatch for {name}: args={int(expected)}, loaded={int(loaded)}."
+            )
+    if str(args.space_mode) != str(dyn_info["space_mode"]):
+        raise ValueError(
+            f"Args/dynamics mismatch for space_mode: args={args.space_mode}, loaded={dyn_info['space_mode']}."
+        )
+
     d_model = dyn_info["d_model"]
     k_max = dyn_info["k_max"]
     n_agent = dyn_info["n_agent"]
@@ -361,23 +474,38 @@ def train(args):
     use_amp = torch.cuda.is_available()
     scaler = GradScaler(device="cuda", enabled=use_amp)
 
+    # --- Diagnostics hook (optional) ---
+    diag_path = args.diag_jsonl
+    if (not diag_path) and args.diag_enable:
+        diag_path = str(Path(args.ckpt_dir) / "diagnostics" / "phase2_diagnostics.jsonl")
+    snapshot_dir = args.diag_snapshot_dir
+    if (not snapshot_dir) and args.diag_enable:
+        snapshot_dir = str(Path(args.ckpt_dir) / "diagnostics" / "spike_samples")
+    diag_hook = AgentDiagnosticsHook(
+        DiagnosticsConfig(
+            enabled=bool(args.diag_enable),
+            every=int(args.diag_every),
+            topk=int(args.diag_topk),
+            bc_spike_mult=float(args.diag_bc_spike_mult),
+            bc_abs_threshold=float(args.diag_bc_abs_threshold),
+            ema_decay=float(args.diag_ema_decay),
+            jsonl_path=diag_path,
+            snapshot_dir=snapshot_dir,
+            snapshot_topk=int(args.diag_snapshot_topk),
+        ),
+        task_names=list(dataset.tasks),
+        source_names=[f"{dd}|{fd}" for dd, fd in dataset.sources],
+    )
+
     # --- Wandb ---
     if is_rank0():
-        try:
-            import wandb
-            wandb.init(
-                project=args.wandb_project,
-                name=args.wandb_run_name,
-                entity=args.wandb_entity,
-                mode="online" if args.wandb_project else "disabled",
-                config=vars(args),
-            )
-            use_wandb = True
-        except Exception:
-            use_wandb = False
-            print("[warn] wandb init failed, logging to console only")
-    else:
-        use_wandb = False
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            entity=args.wandb_entity,
+            mode="online" if args.wandb_project else "disabled",
+            config=vars(args),
+        )
 
     # --- Resume ---
     step = 0
@@ -418,12 +546,18 @@ def train(args):
                 if step >= args.max_steps:
                     break
 
-                # --- Unpack batch ---
+                # Unpack batch
                 obs_u8 = batch["obs"].to(device, non_blocking=True)      # (B, T+1, 3, H, W) uint8
                 act = batch["act"].to(device, non_blocking=True)         # (B, T, 16) float
                 mask = batch["act_mask"].to(device, non_blocking=True)   # (B, T, 16) float
                 rew = batch["rew"].to(device, non_blocking=True)         # (B, T) float
                 emb_id = batch["emb_id"].to(device, non_blocking=True)   # (B,) long
+                task_id = batch["task_id"].to(device, non_blocking=True)       # (B,) long
+                source_id = batch["source_id"].to(device, non_blocking=True)   # (B,) long
+                segment_idx = batch["segment_idx"].to(device, non_blocking=True)   # (B,) long
+                window_start = batch["window_start"].to(device, non_blocking=True) # (B,) long
+                episode_id = batch["episode_id"].to(device, non_blocking=True)     # (B,) long
+                sample_idx = batch["sample_idx"].to(device, non_blocking=True)     # (B,) long
 
                 act = act.clamp(-1, 1) * mask
 
@@ -437,7 +571,7 @@ def train(args):
 
                 B, T = frames.shape[:2]
 
-                # --- Frozen encode ---
+                # Encode
                 with torch.no_grad():
                     patches = temporal_patchify(frames, patch)
                     z_btLd, _ = encoder(patches)
@@ -541,20 +675,48 @@ def train(args):
                         f"r_tgt={rw_aux['reward_target_mean'].item():.3f} "
                         f"| {elapsed:.2f}h"
                     )
-                    if use_wandb:
-                        import wandb
-                        wandb.log({
-                            "loss/total": total_loss.item(),
-                            "loss/dynamics": dyn_loss.item(),
-                            "loss/bc": bc_l.item(),
-                            "loss/reward": rw_l.item(),
-                            "loss/flow_mse": dyn_aux["flow_mse"].item(),
-                            "loss/bootstrap_mse": dyn_aux["bootstrap_mse"].item(),
-                            "stats/bc_mean_std": bc_aux["bc_mean_std"].item(),
-                            "stats/reward_pred_mean": rw_aux["reward_pred_mean"].item(),
-                            "stats/reward_target_mean": rw_aux["reward_target_mean"].item(),
-                            "time/hrs": elapsed,
-                        }, step=step)
+                    wandb.log({
+                        "loss/total": total_loss.item(),
+                        "loss/dynamics": dyn_loss.item(),
+                        "loss/bc": bc_l.item(),
+                        "loss/reward": rw_l.item(),
+                        "loss/flow_mse": dyn_aux["flow_mse"].item(),
+                        "loss/bootstrap_mse": dyn_aux["bootstrap_mse"].item(),
+                        "stats/bc_mean_std": bc_aux["bc_mean_std"].item(),
+                        "stats/reward_pred_mean": rw_aux["reward_pred_mean"].item(),
+                        "stats/reward_target_mean": rw_aux["reward_target_mean"].item(),
+                        "time/hrs": elapsed,
+                    }, step=step)
+
+                if is_rank0():
+                    elapsed = (time.time() - t0) / 3600.0
+                    spike_msg = diag_hook.maybe_record(
+                        step=step,
+                        bc_loss=float(bc_l.item()),
+                        dyn_loss=float(dyn_loss.item()),
+                        rew_loss=float(rw_l.item()),
+                        total_loss=float(total_loss.item()),
+                        flow_mse=float(dyn_aux["flow_mse"].item()),
+                        boot_mse=float(dyn_aux["bootstrap_mse"].item()),
+                        h_t=h_pooled.detach(),
+                        policy=policy,
+                        actions=act.detach(),
+                        act_mask=mask.detach(),
+                        rewards=rew.detach(),
+                        obs_u8=obs_u8.detach(),
+                        mtp_length=int(args.mtp_length),
+                        task_ids=task_id.detach(),
+                        source_ids=source_id.detach(),
+                        segment_idx=segment_idx.detach(),
+                        window_start=window_start.detach(),
+                        episode_id=episode_id.detach(),
+                        sample_idx=sample_idx.detach(),
+                        reward_pred_mean=float(rw_aux["reward_pred_mean"].item()),
+                        reward_target_mean=float(rw_aux["reward_target_mean"].item()),
+                        elapsed_hours=float(elapsed),
+                    )
+                    if spike_msg is not None:
+                        print(spike_msg)
 
                 # --- Checkpointing ---
                 if is_rank0() and args.save_every > 0 and step > 0 and (step % args.save_every == 0) and do_step:
@@ -590,45 +752,70 @@ def train(args):
     if ddp:
         dist.barrier()
         dist.destroy_process_group()
+    diag_hook.close()
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Phase 2: Agent Finetuning (BC + Reward + Dynamics)")
 
     # Data
-    p.add_argument("--data_dirs", type=str, nargs="+", default=["/public/dreamer4/expert"])
-    p.add_argument("--frame_dirs", type=str, nargs="+", default=["/public/dreamer4/expert-shards"])
-    p.add_argument("--tasks_json", type=str, default="tasks.json")
+    p.add_argument("--data_dirs", type=str, nargs="+", default=[   # paths to raw data
+        "/public/dreamer4/expert",
+        "/public/dreamer4/mixed-small",
+        "/public/dreamer4/mixed-large",
+    ])
+    p.add_argument("--frame_dirs", type=str, nargs="+", default=[  # paths to preprocessed frames
+        "/public/dreamer4/expert-shards",
+        "/public/dreamer4/mixed-small-shards",
+        "/public/dreamer4/mixed-large-shards",
+    ])
+    p.add_argument("--tasks_json", type=str, default="../tasks.json")
     p.add_argument("--seq_len", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--tasks", type=str, nargs="+", default=None,
                    help="Task subset. Default: all 30 TASK_SET tasks.")
 
-    # Checkpoints
+    # tokenizer restore
     p.add_argument("--tokenizer_ckpt", type=str, default="logs/tokenizer.pt")
+    p.add_argument("--H", type=int, default=None)
+    p.add_argument("--W", type=int, default=None)
+    p.add_argument("--C", type=int, default=None)
+    p.add_argument("--patch", type=int, default=None)
+
+    # dynamics arch
     p.add_argument("--dynamics_ckpt", type=str, default="logs/dynamics.pt")
+    p.add_argument("--d_model_dyn", type=int, default=512)
+    p.add_argument("--dyn_depth", type=int, default=8)
+    p.add_argument("--n_heads", type=int, default=4)
+    p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--mlp_ratio", type=float, default=4.0)
+    p.add_argument("--time_every", type=int, default=1)
+
     p.add_argument("--packing_factor", type=int, default=2)
+    p.add_argument("--n_register", type=int, default=4)
+    p.add_argument("--n_agent", type=int, default=1)
     p.add_argument("--space_mode", type=str, default="wm_agent",
                    help="Attention mode for agent tokens. Use 'wm_agent' so agent tokens "
                         "can attend to actions/state (required for RL).")
 
-    # Head architecture
+    # behavior clone and reward head architecture
     p.add_argument("--action_dim", type=int, default=16)
     p.add_argument("--mtp_length", type=int, default=8)
     p.add_argument("--head_mlp_ratio", type=float, default=2.0)
 
-    # Shortcut/flow
-    p.add_argument("--bootstrap_start", type=int, default=5_000)
+    # shortcut / schedule
+    p.add_argument("--k_max", type=int, default=8)
+    p.add_argument("--bootstrap_start", type=int, default=0) # NOTE: may need to be 0, chnged from 5_000
     p.add_argument("--self_fraction", type=float, default=0.25)
 
-    # Loss weights
+    # loss weights
     p.add_argument("--w_dynamics", type=float, default=1.0)
     p.add_argument("--w_bc", type=float, default=1.0)
     p.add_argument("--w_reward", type=float, default=1.0)
 
     # Optimization
-    p.add_argument("--lr", type=float, default=3e-4, help="LR for heads + task embedder")
+    p.add_argument("--lr", type=float, default=1e-4, help="LR for heads + task embedder")
     p.add_argument("--lr_dynamics", type=float, default=1e-4, help="LR for dynamics (lower, since pre-trained)")
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--max_steps", type=int, default=100_000)
@@ -648,5 +835,25 @@ if __name__ == "__main__":
 
     # Misc
     p.add_argument("--seed", type=int, default=0)
+
+    # Diagnostics
+    p.add_argument("--diag_enable", action="store_true",
+                   help="Enable detailed per-batch diagnostics for BC outlier analysis.")
+    p.add_argument("--diag_every", type=int, default=25,
+                   help="Emit detailed diagnostics every N steps.")
+    p.add_argument("--diag_topk", type=int, default=3,
+                   help="Top-K outlier samples (by BC NLL) to log per diagnostic event.")
+    p.add_argument("--diag_bc_spike_mult", type=float, default=8.0,
+                   help="Spike threshold multiplier over BC EMA.")
+    p.add_argument("--diag_bc_abs_threshold", type=float, default=100.0,
+                   help="Absolute BC threshold for spike detection.")
+    p.add_argument("--diag_ema_decay", type=float, default=0.99,
+                   help="EMA decay used for BC spike thresholding.")
+    p.add_argument("--diag_jsonl", type=str, default="",
+                   help="Path to JSONL diagnostics file (default: <ckpt_dir>/diagnostics/phase2_diagnostics.jsonl).")
+    p.add_argument("--diag_snapshot_dir", type=str, default="",
+                   help="Directory to dump full top-K spike samples as .pt files.")
+    p.add_argument("--diag_snapshot_topk", type=int, default=3,
+                   help="Top-K outlier samples to dump per spike event.")
 
     train(p.parse_args())

@@ -262,7 +262,7 @@ class PolicyHead(nn.Module):
         B, T, D = h_t.shape
         raw = self.mlp(h_t)  # (B, T, L*A*2)
         raw = raw.view(B, T, self.mtp_length, self.action_dim, 2)
-        mu = raw[..., 0]   # (B, T, L, A) — pre-tanh, unbounded
+        mu = 5.0 * torch.tanh(raw[..., 0] / 5.0)  # pre-tanh mean, bounded to [-5, 5]
         std_raw = raw[..., 1]
 
         # Bounded log_std via tanh (TD-MPC2 style)
