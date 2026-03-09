@@ -255,8 +255,8 @@ def imagine_rollout(
                 act_mask=am_hist,
                 agent_tokens=ag_hist,
             )
-        # h_t_full: (B, t, n_agent, d_model) — take last timestep -- only need last step to initialize
-        h_last = h_t_full[:, -1, 0, :]  # (B, d_model) # might need (B, 1, d_model)
+        # h_t_full: (B, t, n_agent, d_model) — pool over agent tokens, take last timestep
+        h_last = h_t_full.mean(dim=2)[:, -1]  # (B, d_model)
 
         # Value prediction at this state
         with autocast(device_type="cuda", enabled=use_amp):
@@ -332,7 +332,7 @@ def imagine_rollout(
                     act_mask=am_ext,
                     agent_tokens=ag_ext,
                 )
-        h_next = h_new[:, -1, 0, :]  # (B, d_model)
+        h_next = h_new.mean(dim=2)[:, -1]  # (B, d_model)
         with autocast(device_type="cuda", enabled=use_amp):
             r = reward_head.predict(h_next.unsqueeze(1), step=0)[:, 0]  # (B,)
         rewards_list.append(r.detach())
@@ -357,7 +357,7 @@ def imagine_rollout(
                 act_mask=am_hist,
                 agent_tokens=ag_hist,
             )
-    h_boot = h_final[:, -1, 0, :]
+    h_boot = h_final.mean(dim=2)[:, -1]  # (B, d_model)
     with autocast(device_type="cuda", enabled=use_amp):
         v_boot = value_head.predict(h_boot.unsqueeze(1))[:, 0]
     values_list.append(v_boot)
