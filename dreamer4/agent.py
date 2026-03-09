@@ -10,7 +10,7 @@
 #   - pmpo_loss: PMPO policy objective (Eq. 11 from paper)
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -141,60 +141,81 @@ class TanhNormal:
     """Normal distribution followed by tanh squashing.
 
     Samples: x ~ Normal(mu, sigma), a = tanh(x)
-    Log prob: log p(a) = log N(x; mu, sigma) - sum(log(1 - tanh(x)^2))
+    Log prob: log p(a) = sum_j m_j * [log N(x_j; mu_j, sigma_j) - log(1 - a_j^2)]
 
-    This gives a proper density over [-1, 1] with correct Jacobian correction.
+    where m_j is an optional per-dimension validity mask (1=valid, 0=padding).
+    Masking is done by zeroing the noise eps for invalid dims before squashing,
+    which forces a_j = tanh(0) = 0 for those dims and excludes them from all
+    log-prob sums. log_prob_per_dim is always unmasked (callers apply the mask).
     """
 
-    def __init__(self, mu: torch.Tensor, sigma: torch.Tensor):
+    def __init__(self, mu: torch.Tensor, sigma: torch.Tensor,
+                 mask: Optional[torch.Tensor] = None):
         """
         Args:
-            mu: (..., action_dim) pre-tanh mean
+            mu:    (..., action_dim) pre-tanh mean
             sigma: (..., action_dim) std in pre-tanh space
+            mask:  (..., action_dim) or broadcastable; 1.0=valid, 0.0=padding.
+                   If None, all dimensions are treated as valid.
         """
         self.mu = mu
         self.sigma = sigma
+        self.mask = mask
         self._normal = Independent(Normal(mu, sigma), 1)
 
     def rsample(self) -> torch.Tensor:
-        """Differentiable sample in [-1, 1]."""
-        x = self._normal.rsample()
+        """Differentiable sample in [-1, 1]. Invalid dims yield exactly 0."""
+        x = Normal(self.mu, self.sigma).rsample()  # x = mu + sigma * eps
+        if self.mask is not None:
+            x = x * self.mask   # x_j = 0 for invalid dims → tanh(0) = 0
         return torch.tanh(x)
 
     def rsample_with_log_prob(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample and compute log_prob without atanh round-trip (TD-MPC2 style).
+        """Sample + log_prob without atanh round-trip (numerically stable).
 
-        This is more numerically stable than rsample() + log_prob() because it
-        computes the Jacobian directly from the pre-tanh sample, avoiding the
-        lossy atanh(tanh(x)) round-trip when actions saturate near ±1.
+        The mask zeroes the full pre-tanh value x for invalid dims, ensuring
+        a_j = tanh(0) = 0.  The per-dim log-prob of invalid dims is then also
+        zeroed before summing, so they contribute nothing to entropy / KL.
 
         Returns:
-            actions: (..., action_dim) in [-1, 1]
-            log_prob: (...) log probabilities
+            actions:  (..., action_dim) in [-1, 1]; invalid dims are 0.
+            log_prob: (...) summed only over valid dims.
         """
-        x = self._normal.rsample()
+        x = Normal(self.mu, self.sigma).rsample()  # x = mu + sigma * eps
+        if self.mask is not None:
+            x = x * self.mask   # x_j = 0 for invalid dims
         actions = torch.tanh(x)
-        log_p = self._normal.log_prob(x)
-        # Jacobian: -sum(log(1 - tanh(x)^2)), computed from x directly
-        log_p = log_p - torch.log(torch.relu(1 - actions.pow(2)) + 1e-6).sum(dim=-1)
+
+        # Per-dim log prob + Jacobian correction computed from the masked x.
+        # Invalid dims: x_j = 0, a_j = 0, log N(0; mu_j, sigma_j) - 0, then * mask = 0.
+        per_dim_lp = Normal(self.mu, self.sigma).log_prob(x)
+        per_dim_lp = per_dim_lp - torch.log(torch.relu(1 - actions.pow(2)) + 1e-6)
+        if self.mask is not None:
+            per_dim_lp = per_dim_lp * self.mask
+        log_p = per_dim_lp.sum(dim=-1)
         return actions, log_p
 
     def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
-        """Log prob of external actions in [-1, 1] with Jacobian correction.
+        """Log prob of external actions, summed over valid dims only.
 
-        For log_prob of freshly sampled actions, prefer rsample_with_log_prob()
-        which avoids the lossy atanh round-trip.
+        Prefer rsample_with_log_prob() for freshly sampled actions to avoid
+        the lossy atanh(tanh(x)) round-trip near saturation.
 
         Args:
             actions: (..., action_dim) in [-1, 1]
 
         Returns:
-            (...) log probabilities (summed over action dims)
+            (...) log probabilities (masked sum over action dims)
         """
-        return self.log_prob_per_dim(actions).sum(dim=-1)
+        per_dim = self.log_prob_per_dim(actions)  # (..., action_dim)
+        if self.mask is not None:
+            per_dim = per_dim * self.mask
+        return per_dim.sum(dim=-1)
 
     def log_prob_per_dim(self, actions: torch.Tensor) -> torch.Tensor:
-        """Per-dimension log prob with Jacobian correction.
+        """Per-dimension log prob with Jacobian correction (no masking applied).
+
+        Callers that need masking (e.g. bc_loss) apply it externally.
 
         Args:
             actions: (..., action_dim) in [-1, 1]
@@ -212,8 +233,11 @@ class TanhNormal:
 
     @property
     def mean(self) -> torch.Tensor:
-        """Deterministic action (tanh of the mean)."""
-        return torch.tanh(self.mu)
+        """Deterministic action (tanh of the mean). Invalid dims are 0."""
+        m = torch.tanh(self.mu)
+        if self.mask is not None:
+            m = m * self.mask
+        return m
 
 
 # ---------------------------------------------------------------------------
@@ -273,40 +297,47 @@ class PolicyHead(nn.Module):
 
         return mu, std
 
-    def dist(self, h_t: torch.Tensor, step: Optional[int] = None) -> TanhNormal:
+    def dist(self, h_t: torch.Tensor, step: Optional[int] = None,
+             mask: Optional[torch.Tensor] = None) -> TanhNormal:
         """Get TanhNormal action distribution.
 
         Args:
-            h_t: (B, T, d_model)
+            h_t:  (B, T, d_model)
             step: if given, return dist for that MTP step only (batch shape (B, T));
                   if None, return dist for all L steps (batch shape (B, T, L))
+            mask: (..., action_dim) broadcastable validity mask (1=valid, 0=padding).
+                  Typically (B, 1, action_dim) so it broadcasts over T/L dimensions.
+                  If None, all dims are treated as valid.
 
         Returns:
             TanhNormal distribution with event shape (action_dim,)
         """
         mu, std = self.forward(h_t)  # (B, T, L, A)
         if step is not None:
-            return TanhNormal(mu[:, :, step], std[:, :, step])
-        return TanhNormal(mu, std)
+            return TanhNormal(mu[:, :, step], std[:, :, step], mask=mask)
+        return TanhNormal(mu, std, mask=mask)
 
-    def sample(self, h_t: torch.Tensor, step: Optional[int] = None) -> torch.Tensor:
-        """Sample actions in [-1, 1].
+    def sample(self, h_t: torch.Tensor, step: Optional[int] = None,
+               mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Sample actions in [-1, 1]. Invalid dims (mask=0) yield exactly 0.
 
         Returns: (B, T, action_dim) if step given, else (B, T, L, action_dim)
         """
-        return self.dist(h_t, step).rsample()
+        return self.dist(h_t, step, mask=mask).rsample()
 
     def log_prob(self, h_t: torch.Tensor, actions: torch.Tensor,
-                 step: Optional[int] = None) -> torch.Tensor:
-        """Log prob of actions under the TanhNormal policy.
+                 step: Optional[int] = None,
+                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Log prob of actions under the TanhNormal policy (masked sum).
 
         Args:
-            h_t: (B, T, d_model)
+            h_t:     (B, T, d_model)
             actions: (B, T, action_dim) if step given, else (B, T, L, action_dim)
+            mask:    (..., action_dim) broadcastable; if None all dims count.
 
         Returns: (B, T) if step given, else (B, T, L)
         """
-        return self.dist(h_t, step).log_prob(actions)
+        return self.dist(h_t, step, mask=mask).log_prob(actions)
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +541,7 @@ def pmpo_loss(
     log_probs_prior: Optional[torch.Tensor] = None,
     alpha: float = 0.5,
     beta: float = 0.3,
-    action_dim: int = 1,
+    action_dim: Union[int, torch.Tensor] = 1,
     entropy_coef: float = 3e-4,
 ) -> torch.Tensor:
     """Policy loss with advantage-weighted policy gradient + KL + entropy.
@@ -528,14 +559,25 @@ def pmpo_loss(
         log_probs_prior: (N,) log π_prior(a|s) under frozen behavioral prior, or None
         alpha: unused (kept for API compatibility)
         beta: KL regularization coefficient
-        action_dim: number of action dimensions (for normalizing continuous log_probs)
+        action_dim: number of valid action dimensions for normalizing log_probs.
+            Can be a scalar int (same for all samples) or a (N,) tensor of
+            per-sample valid dim counts. A multi-task batch may contain episodes
+            from tasks with different action space sizes — passing per-sample
+            counts ensures log_prob scale is consistent across tasks regardless
+            of padding, rather than under-normalizing tasks with fewer valid dims
+            relative to the global max.
         entropy_coef: coefficient for entropy regularization (prevents std collapse)
 
     Returns:
         scalar loss
     """
-    # Normalize log_probs by action_dim for scale-invariance
-    lp = log_probs / max(action_dim, 1)
+    # Normalize log_probs by valid action dim count for scale-invariance.
+    # action_dim may be a per-sample (N,) tensor when the batch mixes tasks with
+    # different numbers of valid dims; clamp to ≥1 to guard against zero masks.
+    if isinstance(action_dim, torch.Tensor):
+        lp = log_probs / action_dim.clamp(min=1).float()
+    else:
+        lp = log_probs / max(action_dim, 1)
 
     # Normalize advantages to zero mean / unit std.
     adv_std = advantages.std()
@@ -556,10 +598,13 @@ def pmpo_loss(
     # Prevents std collapse for continuous actions.
     entropy_loss = entropy_coef * lp.mean()
 
-    # KL to behavioral prior (also normalized by action_dim)
+    # KL to behavioral prior (also normalized by the same per-sample action_dim)
     kl_loss = torch.tensor(0.0, device=log_probs.device)
     if log_probs_prior is not None and beta > 0:
-        lp_prior = log_probs_prior / max(action_dim, 1)
+        if isinstance(action_dim, torch.Tensor):
+            lp_prior = log_probs_prior / action_dim.clamp(min=1).float()
+        else:
+            lp_prior = log_probs_prior / max(action_dim, 1)
         kl_loss = (lp - lp_prior).mean()
 
     return policy_loss + entropy_loss + beta * kl_loss
