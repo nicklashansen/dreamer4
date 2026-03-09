@@ -216,6 +216,12 @@ def make_plot(events: List[Dict[str, Any]], out_png: Path, smooth_w: int = 5, ys
     plt.close(fig)
 
 
+def _scaled_out_path(base: Path, yscale: str) -> Path:
+    if yscale == "linear":
+        return base
+    return base.with_name(f"{base.stem}_{yscale}{base.suffix}")
+
+
 def write_summary(events: List[Dict[str, Any]], out_txt: Path, topn: int = 10) -> None:
     steps = [int(ev.get("step", 0)) for ev in events]
     spikes = [ev for ev in events if bool(ev.get("is_spike", False))]
@@ -295,6 +301,8 @@ def main() -> None:
     p.add_argument("--topn", type=int, default=10, help="Top-N rows in text summary.")
     p.add_argument("--yscale", type=str, default="log", choices=["linear", "log", "symlog"],
                    help="Y-axis scale for line plots.")
+    p.add_argument("--both_scales", action="store_true",
+                   help="Save both linear and log versions (adds *_log.png).")
     args = p.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -312,10 +320,19 @@ def main() -> None:
     out_png.parent.mkdir(parents=True, exist_ok=True)
     out_txt.parent.mkdir(parents=True, exist_ok=True)
 
-    make_plot(events, out_png=out_png, smooth_w=max(1, int(args.smooth)), yscale=args.yscale)
+    if args.both_scales:
+        make_plot(events, out_png=out_png, smooth_w=max(1, int(args.smooth)), yscale="linear")
+        make_plot(events, out_png=_scaled_out_path(out_png, "log"), smooth_w=max(1, int(args.smooth)), yscale="log")
+    else:
+        make_plot(events, out_png=_scaled_out_path(out_png, args.yscale), smooth_w=max(1, int(args.smooth)),
+                  yscale=args.yscale)
     write_summary(events, out_txt=out_txt, topn=max(1, int(args.topn)))
 
-    print(f"Saved plot: {out_png}")
+    if args.both_scales:
+        print(f"Saved plot: {out_png}")
+        print(f"Saved plot: {_scaled_out_path(out_png, 'log')}")
+    else:
+        print(f"Saved plot: {_scaled_out_path(out_png, args.yscale)}")
     print(f"Saved summary: {out_txt}")
     print(f"Parsed events: {len(events)} from {jsonl}")
 

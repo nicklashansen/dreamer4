@@ -9,8 +9,8 @@ Usage:
 
 Looks for <run_dir>/phase2.log and writes <run_dir>/bc_eval_curves.png.
 """
+import argparse
 import re
-import sys
 from pathlib import Path
 
 import matplotlib
@@ -67,7 +67,31 @@ def smooth(y, window=3):
     )
 
 
-def plot_bc_eval(data: dict, out_path: Path):
+def _can_use_log_scale(*arrays: np.ndarray) -> bool:
+    for arr in arrays:
+        finite = arr[np.isfinite(arr)]
+        if len(finite) == 0:
+            continue
+        if np.nanmin(finite) <= 0:
+            return False
+    return True
+
+
+def _apply_scale(ax, yscale: str, *arrays: np.ndarray) -> None:
+    if yscale == "linear":
+        return
+    if yscale == "log" and not _can_use_log_scale(*arrays):
+        return
+    ax.set_yscale(yscale)
+
+
+def _scaled_out_path(base: Path, yscale: str) -> Path:
+    if yscale == "linear":
+        return base
+    return base.with_name(f"{base.stem}_{yscale}{base.suffix}")
+
+
+def plot_bc_eval(data: dict, out_path: Path, yscale: str = "linear"):
     steps = data["steps"]
     w = max(3, len(steps) // 20)  # adaptive smoothing window
 
@@ -79,24 +103,28 @@ def plot_bc_eval(data: dict, out_path: Path):
     ax.set_title("BC NLL (↓ better)")
     ax.set_xlabel("Step")
     ax.grid(True, alpha=0.3)
+    _apply_scale(ax, yscale, data["bc_nll"])
 
     ax = axes[0, 1]
     ax.plot(steps, smooth(data["bc_std"], w), "m-", alpha=0.85)
     ax.set_title("Policy Std — confidence (↓ = more certain)")
     ax.set_xlabel("Step")
     ax.grid(True, alpha=0.3)
+    _apply_scale(ax, yscale, data["bc_std"])
 
     ax = axes[0, 2]
     ax.plot(steps, smooth(data["act_mae"], w), "g-", alpha=0.85)
     ax.set_title("Action MAE — mean |pred − gt| (↓ better)")
     ax.set_xlabel("Step")
     ax.grid(True, alpha=0.3)
+    _apply_scale(ax, yscale, data["act_mae"])
 
     ax = axes[1, 0]
     ax.plot(steps, smooth(data["rew_mse"], w), "r-", alpha=0.85)
     ax.set_title("Reward MSE (↓ better)")
     ax.set_xlabel("Step")
     ax.grid(True, alpha=0.3)
+    _apply_scale(ax, yscale, data["rew_mse"])
 
     ax = axes[1, 1]
     ax.plot(steps, smooth(data["rew_corr"], w), "c-", alpha=0.85)
@@ -105,6 +133,7 @@ def plot_bc_eval(data: dict, out_path: Path):
     ax.set_xlabel("Step")
     ax.set_ylim(-1.05, 1.05)
     ax.grid(True, alpha=0.3)
+    _apply_scale(ax, yscale, data["rew_corr"])
 
     # Summary text panel
     ax = axes[1, 2]
@@ -137,26 +166,35 @@ def plot_bc_eval(data: dict, out_path: Path):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python plot_bc_eval.py <run_dir>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Plot BC-eval curves from phase2.log.")
+    parser.add_argument("run_dir", type=str, help="Run directory containing phase2.log")
+    parser.add_argument("--yscale", type=str, default="linear", choices=["linear", "log", "symlog"],
+                        help="Y-axis scale for line plots.")
+    parser.add_argument("--both_scales", action="store_true",
+                        help="Save both linear and log versions (adds *_log.png).")
+    args = parser.parse_args()
 
-    run_dir = Path(sys.argv[1])
+    run_dir = Path(args.run_dir)
     log = run_dir / "phase2.log"
 
     if not log.exists():
         print(f"No phase2.log found in {run_dir}")
-        sys.exit(1)
+        raise SystemExit(1)
 
     data = parse_bc_eval_log(log)
     if len(data["steps"]) == 0:
         print(f"No [bc_eval ...] lines found in {log}")
         print("Make sure you're running train_agent.py with --eval_every > 0")
-        sys.exit(1)
+        raise SystemExit(1)
 
     print(f"Found {len(data['steps'])} bc_eval entries "
           f"(steps {data['steps'][0]}–{data['steps'][-1]})")
-    plot_bc_eval(data, run_dir / "bc_eval_curves.png")
+    if args.both_scales:
+        plot_bc_eval(data, run_dir / "bc_eval_curves.png", yscale="linear")
+        plot_bc_eval(data, run_dir / "bc_eval_curves_log.png", yscale="log")
+    else:
+        out_path = _scaled_out_path(run_dir / "bc_eval_curves.png", args.yscale)
+        plot_bc_eval(data, out_path, yscale=args.yscale)
 
 
 if __name__ == "__main__":
