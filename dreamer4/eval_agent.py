@@ -175,13 +175,15 @@ def sample_one_step_with_policy(
             act_mask=act_mask_bt,
         )
 
-    # Sample action from policy (or random)
+    # Sample action from policy (or random).
+    # Pass the per-task mask so invalid dims are forced to tanh(0)=0 by construction.
     if policy is not None and h_t is not None:
         h = h_t[:, -1:, 0, :]  # (1, 1, d_model) — last timestep, agent token
-        action = policy.sample(h, step=0)[0, 0]  # (action_dim,)
-        # Pad to 16 dims
+        pi_mask = act_mask[:action_dim].view(1, 1, action_dim)  # (1, 1, action_dim)
+        action = policy.sample(h, step=0, mask=pi_mask)[0, 0]  # (action_dim,)
+        # Pad to 16 dims (invalid dims within action_dim are already 0 from mask)
         full_action = torch.zeros(16, device=device, dtype=torch.float32)
-        full_action[:action_dim] = action[:action_dim]
+        full_action[:action_dim] = action
     else:
         full_action = torch.randn(16, device=device, dtype=torch.float32).clamp(-1, 1) * act_mask
 

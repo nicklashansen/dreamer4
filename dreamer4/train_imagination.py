@@ -217,6 +217,11 @@ def imagine_rollout(
     n_spatial = z_context.shape[2]
     d_spatial = z_context.shape[3]
 
+    # Per-batch action validity mask — constant across time for each element.
+    # act_mask_context: (B, C_t, 16); take first timestep, clip to action_dim.
+    # Shape (B, 1, action_dim) broadcasts over any T dimension in policy.dist().
+    pi_mask = act_mask_context[:, 0, :action_dim].unsqueeze(1)  # (B, 1, action_dim)
+
     K = int(sched["K"])
     e = int(sched["e"])
     tau_sched = sched["tau"]
@@ -250,8 +255,8 @@ def imagine_rollout(
                 act_mask=am_hist,
                 agent_tokens=ag_hist,
             )
-        # h_t_full: (B, t, n_agent, d_model) — take last timestep
-        h_last = h_t_full[:, -1, 0, :]  # (B, d_model)
+        # h_t_full: (B, t, n_agent, d_model) — take last timestep -- only need last step to initialize
+        h_last = h_t_full[:, -1, 0, :]  # (B, d_model) # might need (B, 1, d_model)
 
         # Value prediction at this state
         with autocast(device_type="cuda", enabled=use_amp):
@@ -261,9 +266,11 @@ def imagine_rollout(
         # --- Phase 3: stop_gradient on h_t before policy ---
         h_detached = h_last.detach()
 
-        # Sample action from policy (differentiable through policy params)
+        # Sample action from policy (differentiable through policy params).
+        # pi_mask zeros invalid dims in the noise → a_j = tanh(0) = 0 for j invalid,
+        # and the log-prob sum excludes those dims (correct entropy / KL).
         with autocast(device_type="cuda", enabled=use_amp):
-            dist = policy.dist(h_detached.unsqueeze(1), step=0)  # over (B, 1)
+            dist = policy.dist(h_detached.unsqueeze(1), step=0, mask=pi_mask)
             action_raw, lp_raw = dist.rsample_with_log_prob()  # (B, 1, A), (B, 1)
             action = action_raw[:, 0].clamp(-1, 1)  # (B, action_dim)
             lp = lp_raw[:, 0]  # (B,)
@@ -575,10 +582,20 @@ def train(args):
                 with autocast(device_type="cuda", enabled=use_amp):
                     advantages = (lambda_returns - rollout["values"][:, :-1]).detach()
 
-                    # Log probs under behavioral prior (frozen)
+                    # Log probs under behavioral prior (frozen).
+                    # Use the same per-batch mask so prior and current policy
+                    # log-probs are computed over identical valid dims.
+                    act_mask_1d = act_mask_shifted[:, 0, :action_dim].unsqueeze(1)  # (B,1,A)
                     with torch.no_grad():
-                        prior_dist = policy_prior.dist(rollout["h_states"], step=0)
+                        prior_dist = policy_prior.dist(rollout["h_states"], step=0,
+                                                       mask=act_mask_1d)
                         lp_prior = prior_dist.log_prob(rollout["actions"].detach())  # (B, H)
+
+                    # Per-sample valid dim counts: tasks in a mixed batch may have
+                    # different action space sizes, so normalize each sample by its
+                    # own valid dim count rather than the global max (action_dim).
+                    H = rollout["log_probs"].shape[1]
+                    valid_dims = act_mask_1d.sum(dim=-1).expand(-1, H).reshape(-1)  # (B*H,)
 
                     policy_loss = pmpo_loss(
                         rollout["log_probs"].reshape(-1),
@@ -586,7 +603,7 @@ def train(args):
                         log_probs_prior=lp_prior.reshape(-1),
                         alpha=args.alpha,
                         beta=args.beta,
-                        action_dim=action_dim,
+                        action_dim=valid_dims,
                         entropy_coef=args.entropy_coef,
                     )
 
