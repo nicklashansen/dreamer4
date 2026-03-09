@@ -17,7 +17,7 @@ import io
 
 from task_set import TASK_SET
 from model import (
-    Encoder, Decoder, Tokenizer, Dynamics,
+    Encoder, Decoder, Tokenizer, Dynamics, TaskEmbedder,
     temporal_patchify, temporal_unpatchify,
 )
 from agent import PolicyHead, RewardHead, ValueHead
@@ -96,6 +96,7 @@ def sample_one_timestep_packed(
     sched: Dict[str, Any],
     actions: Optional[torch.Tensor] = None,    # (B,t+1,A) (action[0]=0)
     act_mask: Optional[torch.Tensor] = None,   # (B,t+1,A) or (A,)
+    agent_tokens: Optional[torch.Tensor] = None,  # (B,t+1,n_agent,d_model) or None
     use_amp: bool = True,
 ) -> torch.Tensor:
     """
@@ -145,7 +146,7 @@ def sample_one_timestep_packed(
                 signal_idxs_full,
                 packed_seq,
                 act_mask=actmask_in,
-                agent_tokens=None,
+                agent_tokens=agent_tokens,
             )
 
         x1_hat = x1_hat_full[:, -1:, :, :]
@@ -396,15 +397,27 @@ def load_agent_heads(
     ckpt_path: str,
     device: torch.device,
     d_model: int = 512,
-) -> Tuple[PolicyHead, Optional[RewardHead]]:
-    """Load trained policy (and optionally reward) head from checkpoint.
+    n_agent: int = 1,
+) -> Tuple[PolicyHead, Optional[RewardHead], Optional[TaskEmbedder]]:
+    """Load trained policy (and optionally reward/task_embedder) from checkpoint.
 
     Supports both Phase 2 (dynamics+task_emb+policy+reward) and
     Phase 3 (policy+value) checkpoint formats.
     """
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    action_dim = int(ckpt.get("action_dim", 16))
-    mtp_length = int(ckpt.get("mtp_length", 8))
+    action_dim = ckpt.get("action_dim")
+    mtp_length = ckpt.get("mtp_length")
+
+    # Phase 3 checkpoints don't store these; load from the Phase 2 checkpoint they reference
+    if action_dim is None or mtp_length is None:
+        p2_path = (ckpt.get("args") or {}).get("phase2_ckpt")
+        if p2_path and os.path.isfile(p2_path):
+            p2 = torch.load(p2_path, map_location="cpu")
+            action_dim = action_dim or int(p2.get("action_dim", 16))
+            mtp_length = mtp_length or int(p2.get("mtp_length", 8))
+            del p2
+    action_dim = int(action_dim or 16)
+    mtp_length = int(mtp_length or 8)
 
     # Infer hidden dim from gate_proj weight: shape is (2*hidden, input_dim)
     gate_w = ckpt["policy"].get("mlp.gate_projs.0.weight")
@@ -426,7 +439,61 @@ def load_agent_heads(
         for p in reward.parameters():
             p.requires_grad_(False)
 
-    return policy, reward
+    task_emb = None
+    if "task_embedder" in ckpt:
+        task_emb = TaskEmbedder(d_model=d_model, n_agent=n_agent, use_ids=True, n_tasks=128).to(device)
+        task_emb.load_state_dict(ckpt["task_embedder"])
+        task_emb.eval()
+        for p in task_emb.parameters():
+            p.requires_grad_(False)
+
+    return policy, reward, task_emb
+
+
+def build_task_emb_map(*ckpt_paths: str) -> Dict[str, int]:
+    """Reconstruct task name -> emb_id mapping from checkpoint training args.
+
+    Replicates WMDataset's discovery logic: sorted glob across data_dirs, dedup,
+    optional tasks filter. Uses the checkpoint that trained the task_embedder
+    (i.e. the one that contains a 'task_embedder' key), since that's the
+    checkpoint whose task ordering determines the embedding indices.
+    """
+    # Prioritize checkpoints that contain the task_embedder (Phase 2)
+    ordered = []
+    rest = []
+    for path in ckpt_paths:
+        if not path or not os.path.isfile(path):
+            continue
+        ckpt = torch.load(path, map_location="cpu")
+        if "task_embedder" in ckpt:
+            ordered.append(ckpt)
+        else:
+            rest.append(ckpt)
+    ordered.extend(rest)
+
+    for ckpt in ordered:
+        a = ckpt.get("args") or {}
+        data_dirs = a.get("data_dirs")
+        if not data_dirs:
+            continue
+        tasks_filter = a.get("tasks")  # None means all tasks
+
+        # Discover tasks in same order as WMDataset
+        found = []
+        seen: Set[str] = set()
+        for dd in data_dirs:
+            for p in sorted(glob.glob(os.path.join(dd, "*.pt"))):
+                t = os.path.splitext(os.path.basename(p))[0]
+                if t not in seen:
+                    seen.add(t)
+                    found.append(t)
+
+        # Apply filter if present
+        if tasks_filter is not None:
+            found = [t for t in found if t in set(tasks_filter)]
+
+        return {t: i for i, t in enumerate(found)}
+    return {}
 
 
 def load_html(path: Optional[str], *, fallback: str = "") -> str:
@@ -526,13 +593,26 @@ class InteractiveServer:
         # policy (optional)
         self.policy: Optional[PolicyHead] = None
         self.reward_head: Optional[RewardHead] = None
+        self.task_embedder: Optional[TaskEmbedder] = None
+        self.task_emb_ids: Dict[str, int] = {}  # task name -> emb_id
         self.policy_action_dim: int = 16
         if args.agent_ckpt and os.path.isfile(args.agent_ckpt):
-            self.policy, self.reward_head = load_agent_heads(
-                args.agent_ckpt, self.device, d_model=self.dyn.d_model,
+            self.policy, self.reward_head, self.task_embedder = load_agent_heads(
+                args.agent_ckpt, self.device,
+                d_model=self.dyn.d_model,
+                n_agent=self.dyn.n_agent,
             )
             self.policy_action_dim = self.policy.action_dim
-            print(f"[web] loaded policy from {args.agent_ckpt} (action_dim={self.policy_action_dim})")
+            # Phase 3 checkpoints don't include task_embedder; fall back to dynamics checkpoint
+            if self.task_embedder is None and self.dyn.n_agent > 0:
+                _, _, self.task_embedder = load_agent_heads(
+                    args.dynamics_ckpt, self.device,
+                    d_model=self.dyn.d_model,
+                    n_agent=self.dyn.n_agent,
+                )
+            self.task_emb_ids = build_task_emb_map(args.agent_ckpt, args.dynamics_ckpt)
+            te_str = "yes" if self.task_embedder is not None else "no"
+            print(f"[web] loaded policy from {args.agent_ckpt} (action_dim={self.policy_action_dim}, task_emb={te_str}, {len(self.task_emb_ids)} tasks)")
 
         # choose episode start + encode initial latent
         self.start_idx = self._choose_start_idx(self.initial_task)
@@ -545,7 +625,7 @@ class InteractiveServer:
         patches0 = temporal_patchify(frame0.view(1, 1, self.C, self.H, self.W), self.patch)
         z0_btLd, _ = self.encoder(patches0)
         z0_packed = pack_bottleneck_to_spatial(z0_btLd, n_spatial=self.n_spatial, k=self.args.packing_factor)[0, 0]
-        z0_packed = z0_packed.to(torch.float16) if (self.use_amp and self.device.type == "cuda") else z0_packed.to(torch.float32)
+        z0_packed = z0_packed.to(torch.float32)
         return z0_packed.detach()
 
     def _compute_act_mask(self, task: str) -> Tuple[int, torch.Tensor]:
@@ -658,6 +738,15 @@ class InteractiveServer:
         return past, actions_local, actmask_local
 
     @torch.inference_mode()
+    def _make_agent_tokens(self, T: int, task: str) -> Optional[torch.Tensor]:
+        """Generate agent tokens from task embedder if available."""
+        if self.task_embedder is None:
+            return None
+        idx = self.task_emb_ids.get(task, 0)
+        emb_id = torch.tensor([idx], device=self.device, dtype=torch.long)
+        return self.task_embedder(emb_id, B=1, T=T)  # (1, T, n_agent, d_model)
+
+    @torch.inference_mode()
     def _get_h_t_for_policy(self, st: SessionState) -> torch.Tensor:
         """Run a clean forward pass on the current context to get h_t for the policy."""
         import math as _math
@@ -676,10 +765,14 @@ class InteractiveServer:
             actions_ctx[0, 1:t] = torch.stack(st.a_hist[s + 1: s + t], dim=0)
         act_mask_ctx = st.act_mask_1d.view(1, 1, 16).expand(1, t, 16)
 
-        _, h_t_full = self.dyn(
-            actions_ctx, step_idxs, signal_idxs, past,
-            act_mask=act_mask_ctx,
-        )
+        agent_tokens = self._make_agent_tokens(t, st.task)
+
+        with torch.autocast(device_type=self.device.type, enabled=(self.use_amp and self.device.type == "cuda")):
+            _, h_t_full = self.dyn(
+                actions_ctx, step_idxs, signal_idxs, past,
+                act_mask=act_mask_ctx,
+                agent_tokens=agent_tokens,
+            )
         # h_t_full: (1, t, n_agent, d_model) — take last timestep, first agent token
         return h_t_full[:, -1:, 0, :]  # (1, 1, d_model)
 
@@ -721,6 +814,7 @@ class InteractiveServer:
             st.a_hist.append(a)
 
             past, actions_local, actmask_local = self._build_local_window(st)
+            agent_tokens = self._make_agent_tokens(actions_local.shape[1], st.task)
 
             z_next, _ = sample_one_timestep_packed(
                 self.dyn,
@@ -729,6 +823,7 @@ class InteractiveServer:
                 sched=self.sched,
                 actions=actions_local,
                 act_mask=actmask_local,
+                agent_tokens=agent_tokens,
                 use_amp=self.use_amp,
             )
             st.z_hist.append(_as_2d_packed(z_next.detach()))
@@ -844,6 +939,7 @@ class InteractiveServer:
                     return
 
         async def send_loop():
+            import traceback as _tb
             dt = 1.0 / max(1e-6, float(st.fps))
             next_t = time.monotonic()
 
@@ -854,8 +950,12 @@ class InteractiveServer:
                     continue
                 next_t += dt
 
-                async with self.infer_lock:
-                    jpeg, status = await asyncio.to_thread(self._render_step_sync, st)
+                try:
+                    async with self.infer_lock:
+                        jpeg, status = await asyncio.to_thread(self._render_step_sync, st)
+                except Exception:
+                    _tb.print_exc()
+                    break
 
                 if ws.closed:
                     break
