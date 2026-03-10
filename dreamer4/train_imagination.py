@@ -793,18 +793,17 @@ def train(args):
                     # Diagnostic stats
                     lp_vals = rollout["log_probs"].detach()
                     raw_adv = (lambda_returns - rollout["values"][:, :-1]).detach()
-                    centered_adv = raw_adv - raw_adv.mean(dim=0, keepdim=True)
-                    adv_pos_frac = (centered_adv > 0).float().mean().item()
                     mu_diag, std_diag = policy(rollout["h_states"][:, :1])
                     pi_std_mean = std_diag.mean().item()
 
-                    # Per-timestep advantage breakdown to check temporal bias
-                    adv_by_t = raw_adv  # (B, H)
-                    adv_pos_by_t = (adv_by_t > 0).float().mean(dim=0)  # (H,)
-                    adv_mean_by_t = adv_by_t.mean(dim=0)               # (H,)
-                    t_pos_str  = " ".join(f"{adv_pos_by_t[t].item():.2f}" for t in range(adv_by_t.shape[1]))
-                    t_mean_str = " ".join(f"{adv_mean_by_t[t].item():+.2f}" for t in range(adv_by_t.shape[1]))
-
+                    # Per-timestep advantage breakdown — always show raw to reveal temporal bias.
+                    # If time_normalize_adv is on, also show what the policy actually sees.
+                    adv_pos_frac = (advantages > 0).float().mean().item()
+                    H_log = raw_adv.shape[1]
+                    raw_pos_by_t  = (raw_adv > 0).float().mean(dim=0)
+                    raw_mean_by_t = raw_adv.mean(dim=0)
+                    raw_pos_str  = " ".join(f"{raw_pos_by_t[t].item():.2f}"  for t in range(H_log))
+                    raw_mean_str = " ".join(f"{raw_mean_by_t[t].item():+.2f}" for t in range(H_log))
                     print(
                         f"step {step:07d} | "
                         f"total={total_loss.item():.4f} "
@@ -814,14 +813,20 @@ def train(args):
                         f"R={mean_return:.3f} "
                         f"r={mean_reward:.3f} "
                         f"V={mean_value:.3f} "
-                        f"S={ret_scale:.3f} "
                         f"| lp={lp_vals.mean().item():.1f}[{lp_vals.min().item():.1f},{lp_vals.max().item():.1f}] "
                         f"adv_raw={raw_adv.mean().item():.3f}±{raw_adv.std().item():.3f} "
                         f"std={pi_std_mean:.4f} "
                         f"| {elapsed:.2f}h"
                     )
-                    print(f"         adv+ by t: [{t_pos_str}]")
-                    print(f"         adv  by t: [{t_mean_str}]")
+                    print(f"         adv+(raw) by t: [{raw_pos_str}]")
+                    print(f"         adv (raw) by t: [{raw_mean_str}]")
+                    if args.time_normalize_adv:
+                        norm_pos_by_t  = (advantages > 0).float().mean(dim=0)
+                        norm_mean_by_t = advantages.mean(dim=0)
+                        norm_pos_str  = " ".join(f"{norm_pos_by_t[t].item():.2f}"  for t in range(H_log))
+                        norm_mean_str = " ".join(f"{norm_mean_by_t[t].item():+.2f}" for t in range(H_log))
+                        print(f"         adv+(nrm) by t: [{norm_pos_str}]")
+                        print(f"         adv (nrm) by t: [{norm_mean_str}]")
                     wandb.log({
                         "loss/total": total_loss.item(),
                         "loss/policy": policy_loss.item(),
