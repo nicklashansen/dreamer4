@@ -515,61 +515,47 @@ def pmpo_loss(
     action_dim: Union[int, torch.Tensor] = 1,
     entropy_coef: float = 3e-4,
 ) -> torch.Tensor:
-    """Policy loss with advantage-weighted policy gradient + KL + entropy.
+    """PMPO policy loss (TD-MPC2 Eq. 3).
 
-    L = -mean(normalize(A) * log π / action_dim)   [advantage-weighted PG]
-        + entropy_coef * mean(log π / action_dim)   [entropy regularization]
-        + β * mean(log π - log π_prior) / action_dim [KL to behavioral prior]
+    L = (1-α)/|D-| Σ_{D-} lp  -  α/|D+| Σ_{D+} lp  +  β/N Σ KL[π ∥ π_prior]
 
-    Advantages are normalized to zero mean / unit std. When advantages have
-    near-zero variance (all similar), they are zeroed out → no gradient.
+    D+ = {i : A_i > 0}, D- = {i : A_i ≤ 0}.  With α=0.5, the total weight
+    on D+ and D- is equal regardless of how many samples fall in each set,
+    so even a few negative-advantage samples get proportional influence.
 
     Args:
         log_probs: (N,) log π(a|s) under current policy
-        advantages: (N,) advantage estimates A_s = R^λ_s - v_s
-        log_probs_prior: (N,) log π_prior(a|s) under frozen behavioral prior, or None
-        alpha: unused (kept for API compatibility)
+        advantages: (N,) advantage estimates (raw, not normalized)
+        log_probs_prior: (N,) log π_prior(a|s) under frozen behavioral prior
+        alpha: weight on D+ (positive advantage) term
         beta: KL regularization coefficient
-        action_dim: number of valid action dimensions for normalizing log_probs.
-            Can be a scalar int (same for all samples) or a (N,) tensor of
-            per-sample valid dim counts. A multi-task batch may contain episodes
-            from tasks with different action space sizes — passing per-sample
-            counts ensures log_prob scale is consistent across tasks regardless
-            of padding, rather than under-normalizing tasks with fewer valid dims
-            relative to the global max.
-        entropy_coef: coefficient for entropy regularization (prevents std collapse)
+        action_dim: valid action dims for normalizing log_probs (int or (N,) tensor)
+        entropy_coef: additional entropy regularization coefficient
 
     Returns:
         scalar loss
     """
     # Normalize log_probs by valid action dim count for scale-invariance.
-    # action_dim may be a per-sample (N,) tensor when the batch mixes tasks with
-    # different numbers of valid dims; clamp to ≥1 to guard against zero masks.
     if isinstance(action_dim, torch.Tensor):
         lp = log_probs / action_dim.clamp(min=1).float()
     else:
         lp = log_probs / max(action_dim, 1)
 
-    # Normalize advantages to zero mean / unit std.
-    adv_std = advantages.std()
-    if adv_std > 1e-8:
-        advantages = (advantages - advantages.mean()) / adv_std
-    else:
-        # No meaningful advantage signal — zero out to prevent runaway
-        advantages = torch.zeros_like(advantages)
+    # Split into D+ (positive advantage) and D- (non-positive advantage).
+    pos_mask = (advantages > 0).float()
+    neg_mask = 1.0 - pos_mask
+    n_pos = pos_mask.sum().clamp(min=1)
+    n_neg = neg_mask.sum().clamp(min=1)
 
-    # Advantage-weighted policy gradient.
-    # More robust than sign-split for continuous actions: when all advantages
-    # are similar, normalized advantages → 0 → no gradient (correct behavior).
-    # When there's real signal, positive advantages push log_prob up,
-    # negative push down, proportional to magnitude.
-    policy_loss = -(advantages.detach() * lp).mean()
+    # (1-α)/|D-| Σ_{D-} lp  — push lp DOWN for bad actions
+    # -α/|D+| Σ_{D+} lp     — push lp UP for good actions
+    policy_loss = (1 - alpha) / n_neg * (lp * neg_mask).sum() \
+                - alpha / n_pos * (lp * pos_mask).sum()
 
-    # Entropy regularization: minimize mean(lp) ≈ maximize entropy.
-    # Prevents std collapse for continuous actions.
+    # Entropy regularization (not in original PMPO, but useful for continuous actions).
     entropy_loss = entropy_coef * lp.mean()
 
-    # KL to behavioral prior (also normalized by the same per-sample action_dim)
+    # KL to behavioral prior: β/N Σ (lp - lp_prior)
     kl_loss = torch.tensor(0.0, device=log_probs.device)
     if log_probs_prior is not None and beta > 0:
         if isinstance(action_dim, torch.Tensor):
