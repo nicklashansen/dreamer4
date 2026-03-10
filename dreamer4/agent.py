@@ -542,6 +542,7 @@ def pmpo_loss(
         lp = log_probs / max(action_dim, 1)
 
     # Split into D+ (positive advantage) and D- (non-positive advantage).
+    # NOTE: advantages should be pre-centered (e.g. per-timestep) by the caller.
     pos_mask = (advantages > 0).float()
     neg_mask = 1.0 - pos_mask
     n_pos = pos_mask.sum().clamp(min=1)

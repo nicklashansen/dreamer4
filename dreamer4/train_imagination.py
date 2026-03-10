@@ -641,9 +641,21 @@ def train(args):
                     # Diagnostic stats
                     lp_vals = rollout["log_probs"].detach()
                     raw_adv = (lambda_returns - rollout["values"][:, :-1]).detach()
+                    centered_adv = raw_adv - raw_adv.mean(dim=0, keepdim=True)
+                    adv_pos_frac = (centered_adv > 0).float().mean().item()
                     mu_diag, std_diag = policy(rollout["h_states"][:, :1])
                     pi_std_mean = std_diag.mean().item()
 
+                    # Per-timestep advantage breakdown (B, H) -> (H,)
+                    adv_by_t = centered_adv.reshape(-1, args.horizon)
+                    adv_pos_by_t = (adv_by_t > 0).float().mean(dim=0)  # (H,)
+                    adv_mean_by_t = adv_by_t.mean(dim=0)  # (H,)
+                    t_str = " ".join(f"{adv_pos_by_t[t].item():.2f}" for t in range(args.horizon))
+                    t_mean_str = " ".join(f"{adv_mean_by_t[t].item():+.2f}" for t in range(args.horizon))
+
+                    ret_scale = return_ema.scale.item()
+
+                    warmup_tag = " [warmup]" if step < args.value_warmup else ""
                     print(
                         f"step {step:07d} | "
                         f"total={total_loss.item():.4f} "
@@ -653,10 +665,17 @@ def train(args):
                         f"R={mean_return:.3f} "
                         f"r={mean_reward:.3f} "
                         f"V={mean_value:.3f} "
+                        f"S={ret_scale:.3f} "
                         f"| lp={lp_vals.mean().item():.1f}[{lp_vals.min().item():.1f},{lp_vals.max().item():.1f}] "
                         f"adv_raw={raw_adv.mean().item():.3f}±{raw_adv.std().item():.3f} "
                         f"std={pi_std_mean:.4f} "
-                        f"| {elapsed:.2f}h"
+                        f"| {elapsed:.2f}h{warmup_tag}"
+                    )
+                    print(
+                        f"         adv+ by t: [{t_str}]"
+                    )
+                    print(
+                        f"         adv  by t: [{t_mean_str}]"
                     )
                     if use_wandb:
                         import wandb
