@@ -480,11 +480,9 @@ def compute_lambda_returns(
     device = rewards.device
     dtype = rewards.dtype
 
-    if values.shape[-1] == T + 1:
-        v = values  # (B, T+1)
-    else:
-        # assume values is (B, T) and last value is the bootstrap
-        v = values
+    assert values.shape == (B, T + 1), \
+        f"values must be (B, T+1)=({B}, {T+1}), got {tuple(values.shape)}"
+    v = values
 
     if continuation is None:
         cont = torch.ones(B, T, device=device, dtype=dtype)
@@ -566,3 +564,78 @@ def pmpo_loss(
         kl_loss = (lp - lp_prior).mean()
 
     return policy_loss + entropy_loss + beta * kl_loss
+
+
+def ppo_loss(
+    log_probs: torch.Tensor,
+    log_probs_old: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float = 0.2,
+    entropy_coef: float = 3e-4,
+    action_dim: Union[int, torch.Tensor] = 1,
+) -> torch.Tensor:
+    """Clipped PPO surrogate loss for continuous actions.
+
+    L = -mean(min(ratio*A, clip(ratio, 1-ε, 1+ε)*A)) + entropy_coef * mean(lp)
+
+    Advantages are normalized to zero mean / unit std before use.
+
+    Args:
+        log_probs: (N,) log π_θ(a|s) under current (updated) policy
+        log_probs_old: (N,) log π_old(a|s) fixed from rollout sampling
+        advantages: (N,) A_t = R^λ_t - v_t
+        eps_clip: clipping radius ε
+        entropy_coef: entropy regularization coefficient
+        action_dim: scalar or (N,) per-sample valid dim count for normalization
+    """
+    if isinstance(action_dim, torch.Tensor):
+        norm = action_dim.clamp(min=1).float()
+    else:
+        norm = max(action_dim, 1)
+    lp = log_probs / norm
+
+    adv_std = advantages.std()
+    adv_norm = (advantages - advantages.mean()) / adv_std.clamp(min=1e-8)
+    adv_norm = adv_norm.detach()
+
+    ratio = torch.exp(log_probs - log_probs_old.detach())
+    surr1 = ratio * adv_norm
+    surr2 = ratio.clamp(1.0 - eps_clip, 1.0 + eps_clip) * adv_norm
+    policy_loss = -torch.min(surr1, surr2).mean()
+    entropy_loss = entropy_coef * lp.mean()
+    return policy_loss + entropy_loss
+
+
+def reinforce_loss(
+    log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    entropy_coef: float = 3e-4,
+    action_dim: Union[int, torch.Tensor] = 1,
+) -> torch.Tensor:
+    """REINFORCE with advantage baseline (vanilla policy gradient).
+
+    L = -mean(A_norm * log π / action_dim)
+
+    Advantages are normalized to zero mean / unit std. Simpler than PMPO
+    (no sign-split) and PPO (no clipping) — useful as a baseline.
+
+    Args:
+        log_probs: (N,) log π(a|s)
+        advantages: (N,) A_t = R^λ_t - v_t
+        entropy_coef: entropy regularization coefficient
+        action_dim: scalar or (N,) per-sample valid dim count for normalization
+    """
+    if isinstance(action_dim, torch.Tensor):
+        lp = log_probs / action_dim.clamp(min=1).float()
+    else:
+        lp = log_probs / max(action_dim, 1)
+
+    adv_std = advantages.std()
+    if adv_std > 1e-8:
+        adv_norm = (advantages - advantages.mean()) / adv_std
+    else:
+        adv_norm = torch.zeros_like(advantages)
+
+    policy_loss = -(adv_norm.detach() * lp).mean()
+    entropy_loss = entropy_coef * lp.mean()
+    return policy_loss + entropy_loss
