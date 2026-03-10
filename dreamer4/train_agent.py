@@ -1140,7 +1140,7 @@ if __name__ == "__main__":
         "/public/dreamer4/mixed-small-shards",
         "/public/dreamer4/mixed-large-shards",
     ])
-    p.add_argument("--tasks_json", type=str, default="../tasks.json")
+    p.add_argument("--tasks_json", type=str, default="./tasks.json")
     p.add_argument("--seq_len", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=24)
