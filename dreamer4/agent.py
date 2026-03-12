@@ -19,6 +19,39 @@ from torch.distributions import Normal, Independent
 
 
 # ---------------------------------------------------------------------------
+# Head config validation
+# ---------------------------------------------------------------------------
+
+def _check_head_config(head, ckpt: dict, name: str):
+    """Raise ValueError if a head's config doesn't match saved ckpt metadata.
+
+    Checks num_bins / low / high for RewardHead / ValueHead,
+    mtp_length for RewardHead / PolicyHead,
+    action_dim for PolicyHead.
+    """
+    errors = []
+    for attr, key in [("num_bins", f"{name}_num_bins"),
+                      ("low",      f"{name}_low"),
+                      ("high",     f"{name}_high"),
+                      ("mtp_length", "mtp_length"),
+                      ("action_dim", "action_dim")]:
+        if not hasattr(head, attr):
+            continue
+        saved = ckpt.get(key)
+        if saved is None:
+            # key wasn't saved (old checkpoint) — skip
+            continue
+        actual = getattr(head, attr)
+        if abs(float(actual) - float(saved)) > 1e-6:
+            errors.append(f"  {attr}: head={actual!r} but ckpt saved {saved!r} (key='{key}')")
+    if errors:
+        raise ValueError(
+            f"Head config mismatch for '{name}':\n" + "\n".join(errors) +
+            "\nReconstruct the head with matching parameters or update the checkpoint."
+        )
+
+
+# ---------------------------------------------------------------------------
 # symlog / symexp (Dreamer v3, Hafner et al. 2023)
 # ---------------------------------------------------------------------------
 
@@ -42,7 +75,7 @@ class TwoHotDist:
     Expected value is sum(softmax(logits) * bin_centers), then symexp'd.
     """
 
-    def __init__(self, logits: torch.Tensor, low: float = -20.0, high: float = 20.0):
+    def __init__(self, logits: torch.Tensor, low: float = -1.0, high: float = 9.9):
         """
         Args:
             logits: (..., num_bins)
@@ -356,9 +389,9 @@ class RewardHead(nn.Module):
         hidden: int = 512,
         mlp_depth: int = 2,
         mtp_length: int = 8,
-        num_bins: int = 101,
-        low: float = -10.0,
-        high: float = 10.0,
+        num_bins: int = 11,
+        low: float = 0.0,
+        high: float = 1.25,
     ):
         super().__init__()
         self.mtp_length = int(mtp_length)
@@ -415,8 +448,8 @@ class ValueHead(nn.Module):
         hidden: int = 512,
         mlp_depth: int = 2,
         num_bins: int = 101,
-        low: float = -10.0,
-        high: float = 10.0,
+        low: float = -1.0,
+        high: float = 9.0,
     ):
         super().__init__()
         self.num_bins = int(num_bins)

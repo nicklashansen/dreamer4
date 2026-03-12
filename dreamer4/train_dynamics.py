@@ -945,7 +945,7 @@ if __name__ == "__main__":
     p.add_argument("--self_fraction", type=float, default=0.25)
 
     # actions
-    p.add_argument("--use_actions", action="store_true")
+    p.add_argument("--use_actions", action="store_true") # specified as true in github/pretrained
 
     # optim
     p.add_argument("--lr", type=float, default=1e-4)

@@ -40,7 +40,7 @@ from model import (
     Encoder, Decoder, Tokenizer, Dynamics, TaskEmbedder,
     temporal_patchify, pack_bottleneck_to_spatial,
 )
-from agent import PolicyHead, RewardHead, TanhNormal, TwoHotDist
+from agent import PolicyHead, RewardHead, TanhNormal, TwoHotDist, _check_head_config
 from train_dynamics import (
     get_dist_info, is_rank0, seed_everything, worker_init_fn,
     init_distributed, load_frozen_tokenizer_from_pt_ckpt,
@@ -77,6 +77,9 @@ def save_ckpt(
         "args": vars(args),
         "action_dim": args.action_dim,
         "mtp_length": args.mtp_length,
+        "rw_num_bins": args.rw_num_bins,
+        "rw_low": args.rw_low,
+        "rw_high": args.rw_high,
     }
     tmp = path.with_suffix(".tmp")
     torch.save(obj, tmp)
@@ -94,6 +97,8 @@ def load_ckpt(
     scaler,
 ) -> tuple:
     ckpt = torch.load(path, map_location="cpu")
+    _check_head_config(policy, ckpt, "policy")
+    _check_head_config(reward, ckpt, "rw")
     (dynamics.module if hasattr(dynamics, "module") else dynamics).load_state_dict(ckpt["dynamics"], strict=True)
     task_embedder.load_state_dict(ckpt["task_embedder"], strict=True)
     policy.load_state_dict(ckpt["policy"], strict=True)
@@ -227,6 +232,7 @@ def bc_loss(
     act_mask: torch.Tensor,
     action_dim: int,
     mtp_length: int,
+    sample_weight: Optional[torch.Tensor] = None,
 ) -> tuple:
     """Behavioral cloning loss: masked NLL of dataset actions under the policy.
 
@@ -234,8 +240,8 @@ def bc_loss(
     Per-dim log probs are masked so padding dimensions don't contribute.
 
     If mask_l[..., j] = 0 for an invalid action dimension, the coordinate
-    does not contribute to the loss. We also normalize losses by the number 
-    of valid action dimensions 
+    does not contribute to the loss. We also normalize losses by the number
+    of valid action dimensions
 
     Args:
         h_t: (B, T, d_model)
@@ -243,6 +249,9 @@ def bc_loss(
         act_mask: (B, T, 16) — 1.0 for valid dims, 0.0 for padding
         action_dim: effective action dimensions for current batch
         mtp_length: multi-token prediction length
+        sample_weight: optional (B,) float tensor; rows with weight 0 are
+            excluded from the mean (e.g. pass expert_mask to train BC only
+            on expert data).  If None, all rows contribute equally.
 
     Returns:
         loss: scalar
@@ -252,6 +261,14 @@ def bc_loss(
     # only one forward pass for the l tokens
     mu, std = policy(h_t)  # (B, T, L, A)
     B, T, L, A = mu.shape
+
+    # expert_mask: (B,) float, 1.0 for expert rows, 0.0 otherwise
+    if sample_weight is not None:
+        expert_mask = sample_weight.float().to(h_t.device)   # (B,)
+    else:
+        expert_mask = torch.ones(B, device=h_t.device)
+
+    expert_n = expert_mask.sum().clamp(min=1e-6)              # number of expert samples
 
     total_nll = torch.tensor(0.0, device=h_t.device)
     count = 0
@@ -263,22 +280,28 @@ def bc_loss(
         mask_l = act_mask[:, l:l + valid_T, :A]  # (B, valid_T, A)
 
         dist_l = TanhNormal(mu[:, :valid_T, l, :A], std[:, :valid_T, l, :A])
-        # Per-dim log prob, masked so padding dims don't contribute
-        per_dim = dist_l.log_prob_per_dim(target)  # (B, valid_T, A)
-        masked = per_dim * mask_l
-        nll = -masked.sum(dim=-1) / mask_l.sum(dim=-1).clamp(min=1)
+        # Per-dim log prob, masked so padding dims don't contribute.
+        # Also zero out non-expert rows so they don't affect the loss.
+        per_dim = dist_l.log_prob_per_dim(target)              # (B, valid_T, A)
+        masked = per_dim * mask_l * expert_mask[:, None, None] # zero non-expert rows
+        nll = -masked.sum(dim=-1) / mask_l.sum(dim=-1).clamp(min=1)  # (B, valid_T)
         # Per-timestep NLL cap: prevents individual catastrophic samples
         # (e.g. random-policy mixed-large actions) from exploding the batch mean.
         # 50 nats ≈ chance-level for a 6-dim bounded action; anything higher
         # gives zero useful gradient signal.
         nll = nll.clamp(max=50.0)
-        total_nll = total_nll + nll.mean()
+        # Average only over expert rows (non-expert rows are 0 so excluded from sum)
+        total_nll = total_nll + nll.sum() / (expert_n * valid_T)
         count += 1
 
     loss = total_nll / max(count, 1)
+    # std over expert rows only (non-expert rows would inflate/deflate the metric)
+    exp_w = expert_mask[:, None, None, None].expand_as(std)
+    expert_std = (std * exp_w).sum() / exp_w.sum().clamp(min=1e-6)
     aux = {
         "bc_nll": loss.detach(),
-        "bc_mean_std": std.mean().detach(),
+        "bc_mean_std": expert_std.detach(),
+        "bc_expert_frac": (expert_mask > 0).float().mean().detach(),
     }
     return loss, aux
 
@@ -572,12 +595,21 @@ def run_bc_eval(
     )
 
     # Reward quality
-    reward_pred = reward_head.predict(h_pooled, step=0)  # (B, T)
+    rw_dist = reward_head.dist(h_pooled, step=0)          # TwoHotDist over (B, T, num_bins)
+    reward_pred = rw_dist.mean                             # (B, T)
     reward_mse = float((reward_pred - rewards).pow(2).mean().item())
     reward_mae_val = float((reward_pred - rewards).abs().mean().item())
     rp, rt = reward_pred.flatten(), rewards.flatten()
     reward_corr = float(torch.corrcoef(torch.stack([rp, rt]))[0, 1].item()) \
         if rp.std() > 1e-6 and rt.std() > 1e-6 else 0.0
+
+    # Bin collapse diagnostics (reward head)
+    rw_probs = rw_dist.probs                               # (B, T, num_bins)
+    rw_entropy = -(rw_probs * (rw_probs + 1e-8).log()).sum(dim=-1).mean()  # scalar
+    rw_max_entropy = math.log(rw_dist.num_bins)
+    rw_entropy_ratio = float(rw_entropy.item() / rw_max_entropy)
+    rw_argmax = rw_probs.argmax(dim=-1)                    # (B, T)
+    rw_n_unique = int(rw_argmax.unique().numel())
 
     # Per-task NLL breakdown
     per_task_logs = {}
@@ -597,6 +629,8 @@ def run_bc_eval(
         f"{tag}/reward_corr":        reward_corr,
         f"{tag}/reward_pred_mean":   float(reward_pred.mean().item()),
         f"{tag}/reward_target_mean": float(rewards.mean().item()),
+        f"{tag}/rw_entropy_ratio":   rw_entropy_ratio,       # 0=collapsed, 1=max uncertainty
+        f"{tag}/rw_n_unique_bins":   rw_n_unique,            # out of reward_head.num_bins
     }
     log_dict.update(per_task_logs)
     wandb.log(log_dict, step=step)
@@ -607,7 +641,8 @@ def run_bc_eval(
         f"bc_std={bc_std_mean:.3f} "
         f"act_mae={action_mae:.4f} "
         f"rew_mse={reward_mse:.5f} "
-        f"rew_corr={reward_corr:.3f}"
+        f"rew_corr={reward_corr:.3f} "
+        f"rw_ent={rw_entropy_ratio:.2f} rw_bins={rw_n_unique}/{reward_head.num_bins}"
     )
 
     # Visual panel: frame strip + action prediction heatmap
@@ -629,16 +664,52 @@ def run_bc_eval(
     if was_training["rw"]:  reward_head.train()
 
 
-# ---------------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------------
+def check_agreement(args, dyn_info, H_tokenizer, W_tokenizer, C_tokenizer,
+                    patch_tokenizer, n_latents_tokenizer, d_bottleneck,
+                    n_spatial, d_spatial):
+    dyn_ckpt_args = dyn_info.get("ckpt_args", {}) or {}
+    for name, tok_val in (
+        ("H", H_tokenizer),
+        ("W", W_tokenizer),
+        ("C", C_tokenizer),
+        ("patch", patch_tokenizer),
+        ("n_latents", n_latents_tokenizer),
+        ("d_bottleneck", d_bottleneck),
+        ("packing_factor", int(args.packing_factor)),
+        ("n_spatial", n_spatial),
+        ("d_spatial", d_spatial),
+    ):
+        if dyn_ckpt_args.get(name) is not None and int(dyn_ckpt_args[name]) != int(tok_val):
+            raise ValueError(
+                f"Tokenizer/dynamics mismatch for {name}: tokenizer/runtime={tok_val}, "
+                f"dynamics ckpt={int(dyn_ckpt_args[name])}."
+            )
+
+    runtime_vs_loaded = (
+        ("d_model_dyn", args.d_model_dyn, dyn_info["d_model"]),
+        ("k_max", args.k_max, dyn_info["k_max"]),
+        ("n_agent", args.n_agent, dyn_info["n_agent"]),
+        ("n_heads", args.n_heads, dyn_info["n_heads"]),
+        ("dyn_depth", args.dyn_depth, dyn_info["dyn_depth"]),
+        ("n_register", args.n_register, dyn_info["n_register"]),
+    )
+    for name, expected, loaded in runtime_vs_loaded:
+        if int(expected) != int(loaded):
+            raise ValueError(
+                f"Args/dynamics mismatch for {name}: args={int(expected)}, loaded={int(loaded)}."
+            )
+    if str(args.space_mode) != str(dyn_info["space_mode"]):
+        raise ValueError(
+            f"Args/dynamics mismatch for space_mode: args={args.space_mode}, loaded={dyn_info['space_mode']}."
+        )
+
 
 def train(args):
     ddp, rank, world_size, local_rank = init_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
     seed_everything(args.seed + rank)
 
-    # --- Dataset ---
     dataset = WMDataset(
         data_dir=args.data_dirs,
         frames_dir=args.frame_dirs,
@@ -649,6 +720,9 @@ def train(args):
         tasks=args.tasks if args.tasks else TASK_SET,
         verbose=is_rank0(),
     )
+    # Map source_id (int) -> short dataset name (basename of data_dir)
+    source_id_to_name = {i: os.path.basename(dd) for i, (dd, _) in enumerate(dataset.sources)}
+
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
     loader = DataLoader(
         dataset,
@@ -669,6 +743,7 @@ def train(args):
     if args.W is not None: tok_override["W"] = args.W
     if args.C is not None: tok_override["C"] = args.C
     if args.patch is not None: tok_override["patch"] = args.patch
+    
     encoder, decoder, tok_args = load_frozen_tokenizer_from_pt_ckpt(
         args.tokenizer_ckpt, device=device, override=(tok_override or None),
     )
@@ -710,47 +785,15 @@ def train(args):
         packing_factor=args.packing_factor,
         override=dyn_override
     )
-    dyn_ckpt_args = dyn_info.get("ckpt_args", {}) or {}
-    for name, tok_val in (
-        ("H", H_tokenizer),
-        ("W", W_tokenizer),
-        ("C", C_tokenizer),
-        ("patch", patch_tokenizer),
-        ("n_latents", n_latents_tokenizer),
-        ("d_bottleneck", d_bottleneck),
-        ("packing_factor", int(args.packing_factor)),
-        ("n_spatial", n_spatial),
-        ("d_spatial", d_spatial),
-    ):
-        if dyn_ckpt_args.get(name) is not None and int(dyn_ckpt_args[name]) != int(tok_val):
-            raise ValueError(
-                f"Tokenizer/dynamics mismatch for {name}: tokenizer/runtime={tok_val}, "
-                f"dynamics ckpt={int(dyn_ckpt_args[name])}."
-            )
-
-    runtime_vs_loaded = (
-        ("d_model_dyn", args.d_model_dyn, dyn_info["d_model"]),
-        ("k_max", args.k_max, dyn_info["k_max"]),
-        ("n_agent", args.n_agent, dyn_info["n_agent"]),
-        ("n_heads", args.n_heads, dyn_info["n_heads"]),
-        ("dyn_depth", args.dyn_depth, dyn_info["dyn_depth"]),
-        ("n_register", args.n_register, dyn_info["n_register"]),
-    )
-    for name, expected, loaded in runtime_vs_loaded:
-        if int(expected) != int(loaded):
-            raise ValueError(
-                f"Args/dynamics mismatch for {name}: args={int(expected)}, loaded={int(loaded)}."
-            )
-    if str(args.space_mode) != str(dyn_info["space_mode"]):
-        raise ValueError(
-            f"Args/dynamics mismatch for space_mode: args={args.space_mode}, loaded={dyn_info['space_mode']}."
-        )
+    check_agreement(args, dyn_info, H_tokenizer, W_tokenizer, C_tokenizer,
+                    patch_tokenizer, n_latents_tokenizer, d_bottleneck,
+                    n_spatial, d_spatial)
 
     d_model = dyn_info["d_model"]
     k_max = dyn_info["k_max"]
     n_agent = dyn_info["n_agent"]
 
-    # --- New trainable heads ---
+    # Build heads for BC & R
     task_embedder = TaskEmbedder(
         d_model=d_model,
         n_agent=n_agent,
@@ -770,6 +813,9 @@ def train(args):
         d_model=d_model,
         hidden=head_hidden,
         mtp_length=args.mtp_length,
+        num_bins=args.rw_num_bins,
+        low=args.rw_low,
+        high=args.rw_high,
     ).to(device)
 
     if is_rank0():
@@ -789,7 +835,7 @@ def train(args):
             dyn, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False,
         )
 
-    # --- Optimizer ---
+    # Optimizer and scaler
     all_params = [
         {"params": (dyn.module if hasattr(dyn, "module") else dyn).parameters(), "lr": args.lr_dynamics},
         {"params": task_embedder.parameters(), "lr": args.lr},
@@ -820,10 +866,10 @@ def train(args):
             snapshot_topk=int(args.diag_snapshot_topk),
         ),
         task_names=list(dataset.tasks),
-        source_names=[f"{dd}|{fd}" for dd, fd in dataset.sources],
+        source_names=[source_id_to_name[i] for i in range(len(dataset.sources))],
     )
 
-    # --- Wandb ---
+    # Initialize wandb
     if is_rank0():
         wandb.init(
             project=args.wandb_project,
@@ -833,7 +879,7 @@ def train(args):
             config=vars(args),
         )
 
-    # --- Resume ---
+    # Resume from checkpoint
     step = 0
     start_epoch = 0
     ckpt_dir = Path(args.ckpt_dir)
@@ -847,14 +893,14 @@ def train(args):
         if is_rank0():
             print(f"Resumed from {args.resume} (step={step}, epoch={start_epoch})")
 
-    # --- RMS loss normalization (Dreamer v4, Section 3) ---
+    # RMS loss normalization (Dreamer v4, Section 3)
     # "We normalize all loss terms by running estimates of their RMS."
     # Each loss is divided by max(1, EMA(sqrt(loss^2))) so all terms
     # contribute ~equal gradient scale regardless of raw magnitude.
     rms_ema = {"dyn": 1.0, "bc": 1.0, "rew": 1.0}
     rms_decay = 0.99
 
-    # --- Training loop ---
+    # Training loop
     dyn.train()
     policy.train()
     reward_head.train()
@@ -879,7 +925,7 @@ def train(args):
                 rew = batch["rew"].to(device, non_blocking=True)         # (B, T) float
                 emb_id = batch["emb_id"].to(device, non_blocking=True)   # (B,) long
                 task_id = batch["task_id"].to(device, non_blocking=True)       # (B,) long
-                source_id = batch["source_id"].to(device, non_blocking=True)   # (B,) long
+                source_id = batch["source_id"].to(device, non_blocking=True)   # (B,) long; 
                 segment_idx = batch["segment_idx"].to(device, non_blocking=True)   # (B,) long
                 window_start = batch["window_start"].to(device, non_blocking=True) # (B,) long
                 episode_id = batch["episode_id"].to(device, non_blocking=True)     # (B,) long
@@ -895,18 +941,16 @@ def train(args):
                 act_mask_shifted = torch.zeros_like(mask)
                 act_mask_shifted[:, 1:] = mask[:, :-1]
 
-                B, T = frames.shape[:2]
-
-                # Encode
+                # Frozen encoder -> packed spatial tokens z1
                 with torch.no_grad():
                     patches = temporal_patchify(frames, patch)
                     z_btLd, _ = encoder(patches)
                     z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=args.packing_factor)
 
-                # --- Agent tokens from TaskEmbedder ---
+                # Agent tokens from TaskEmbedder
+                B, T = frames.shape[:2]
                 agent_tokens = task_embedder(emb_id, B=B, T=T)  # (B, T, n_agent, d_model)
 
-                # --- Forward pass ---
                 B_self = int(round(args.self_fraction * B))
                 B_self = max(0, min(B - 1, B_self))
 
@@ -931,13 +975,24 @@ def train(args):
                     h_pooled = dyn_aux["h_t"]  # (B, T, d_model)
 
                     # Phase 2: do NOT detach h_t — gradients from heads
-                    # flow back to task_embedder and dynamics agent-token path.
+                    # flow back to task_embedder and dynamics agent-token path
+                    # But for early training, we may want to detach to stabilize BC / R
+                    if step < args.bc_rew_warmup:
+                        h_pooled = h_pooled.detach()
 
-                    # 3) BC loss
+
+                    # 3) BC loss — only on expert data
+                    expert_src_ids = {i for i, name in source_id_to_name.items() if "expert" in name}
+                    expert_mask = torch.zeros(source_id.shape[0], device=device)
+                    for _sid in expert_src_ids:
+                        expert_mask = expert_mask + (source_id == _sid).float()
+                    expert_mask = expert_mask.clamp(max=1.0)
+
                     bc_l, bc_aux = bc_loss(
                         policy, h_pooled, act, mask,
                         action_dim=args.action_dim,
                         mtp_length=args.mtp_length,
+                        sample_weight=expert_mask,
                     )
 
                     # 4) Reward loss
@@ -945,20 +1000,20 @@ def train(args):
 
                     # RMS-normalize each loss (Dreamer v4 paper) + loss clipping
                     with torch.no_grad():
-                        rms_ema["dyn"] = rms_decay * rms_ema["dyn"] + (1 - rms_decay) * abs(dyn_loss.item())
-                        rms_ema["bc"] = rms_decay * rms_ema["bc"] + (1 - rms_decay) * abs(bc_l.item())
-                        rms_ema["rew"] = rms_decay * rms_ema["rew"] + (1 - rms_decay) * abs(rw_l.item())
+                        rms_ema["dyn"] = args.rms_decay * rms_ema["dyn"] + (1 - args.rms_decay) * abs(dyn_loss.item())
+                        rms_ema["bc"] = args.rms_decay * rms_ema["bc"] + (1 - args.rms_decay) * abs(bc_l.item())
+                        rms_ema["rew"] = args.rms_decay * rms_ema["rew"] + (1 - args.rms_decay) * abs(rw_l.item())
 
-                    # Clip each loss to 5x its running average to prevent spike-driven collapse
-                    clip_mult = 5.0
-                    dyn_clip = max(5.0, clip_mult * rms_ema["dyn"])
-                    bc_clip = max(5.0, clip_mult * rms_ema["bc"])
-                    rew_clip = max(5.0, clip_mult * rms_ema["rew"])
+                    # Clip each loss to clip_mult x its running average (clip_mult=0 disables clipping)
+                    def _maybe_clip(loss, ema_val):
+                        if args.clip_mult == 0:
+                            return loss
+                        return loss.clamp(max=max(5.0, args.clip_mult * ema_val))
 
                     total_loss = (
-                        args.w_dynamics * dyn_loss.clamp(max=dyn_clip) / max(1.0, rms_ema["dyn"])
-                        + args.w_bc * bc_l.clamp(max=bc_clip) / max(1.0, rms_ema["bc"])
-                        + args.w_reward * rw_l.clamp(max=rew_clip) / max(1.0, rms_ema["rew"])
+                        args.w_dynamics * _maybe_clip(dyn_loss, rms_ema["dyn"]) / max(1.0, rms_ema["dyn"])
+                        + args.w_bc * _maybe_clip(bc_l, rms_ema["bc"]) / max(1.0, rms_ema["bc"])
+                        + args.w_reward * _maybe_clip(rw_l, rms_ema["rew"]) / max(1.0, rms_ema["rew"])
                     )
 
                 if not torch.isfinite(total_loss):
@@ -989,10 +1044,11 @@ def train(args):
                 if is_rank0() and (step % args.log_every == 0):
                     elapsed = (time.time() - t0) / 3600.0
                     print(
+                        f"outputs {args.ckpt_dir} | "
                         f"step {step:07d} | "
                         f"total={total_loss.item():.4f} "
                         f"dyn={dyn_loss.item():.4f} "
-                        f"bc={bc_l.item():.4f} "
+                        f"bc={bc_l.item():.4f}(exp={bc_aux['bc_expert_frac'].item():.2f}) "
                         f"rew={rw_l.item():.4f} "
                         f"| flow={dyn_aux['flow_mse'].item():.5f} "
                         f"boot={dyn_aux['bootstrap_mse'].item():.5f} "
@@ -1009,6 +1065,7 @@ def train(args):
                         "loss/flow_mse": dyn_aux["flow_mse"].item(),
                         "loss/bootstrap_mse": dyn_aux["bootstrap_mse"].item(),
                         "stats/bc_mean_std": bc_aux["bc_mean_std"].item(),
+                        "stats/bc_expert_frac": bc_aux["bc_expert_frac"].item(),
                         "stats/reward_pred_mean": rw_aux["reward_pred_mean"].item(),
                         "stats/reward_target_mean": rw_aux["reward_target_mean"].item(),
                         "time/hrs": elapsed,
@@ -1129,7 +1186,7 @@ def train(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Phase 2: Agent Finetuning (BC + Reward + Dynamics)")
 
-    # Data
+    # data (if using multiple datasets, make sure they align in order)
     p.add_argument("--data_dirs", type=str, nargs="+", default=[   # paths to raw data
         "/public/dreamer4/expert",
         "/public/dreamer4/mixed-small",
@@ -1140,12 +1197,12 @@ if __name__ == "__main__":
         "/public/dreamer4/mixed-small-shards",
         "/public/dreamer4/mixed-large-shards",
     ])
-    p.add_argument("--tasks_json", type=str, default="./tasks.json")
+    p.add_argument("--tasks_json", type=str, default="./tasks.json") # task metadata
     p.add_argument("--seq_len", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=24)
     p.add_argument("--tasks", type=str, nargs="+", default=None,
-                   help="Task subset. Default: all 30 TASK_SET tasks.")
+                   help="Task subset. Default: all 30 TASK_SET tasks.") # tasks to use here
 
     # tokenizer restore
     p.add_argument("--tokenizer_ckpt", type=str, default="logs/tokenizer.pt")
@@ -1154,7 +1211,7 @@ if __name__ == "__main__":
     p.add_argument("--C", type=int, default=None)
     p.add_argument("--patch", type=int, default=None)
 
-    # dynamics arch
+    # dynamics restore and arch
     p.add_argument("--dynamics_ckpt", type=str, default="logs/dynamics.pt")
     p.add_argument("--d_model_dyn", type=int, default=512)
     p.add_argument("--dyn_depth", type=int, default=8)
@@ -1170,21 +1227,27 @@ if __name__ == "__main__":
                    help="Attention mode for agent tokens. Use 'wm_agent' so agent tokens "
                         "can attend to actions/state (required for RL).")
 
-    # behavior clone and reward head architecture
-    p.add_argument("--action_dim", type=int, default=16)
-    p.add_argument("--mtp_length", type=int, default=8)
-    p.add_argument("--head_mlp_ratio", type=float, default=2.0)
-
     # shortcut / schedule
     p.add_argument("--k_max", type=int, default=8)
     p.add_argument("--bootstrap_start", type=int, default=0) # NOTE: may need to be 0, chnged from 5_000
     p.add_argument("--self_fraction", type=float, default=0.25)
 
+    # behavior clone and reward head architecture
+    p.add_argument("--action_dim", type=int, default=16)
+    p.add_argument("--mtp_length", type=int, default=8)
+    p.add_argument("--head_mlp_ratio", type=float, default=2.0)
+    p.add_argument("--rw_num_bins", type=int, default=11,
+                   help="Number of TwoHot bins for reward head")
+    p.add_argument("--rw_low", type=float, default=0.0,
+                   help="Lower bound of reward head bins in symlog space")
+    p.add_argument("--rw_high", type=float, default=1.25,
+                   help="Upper bound of reward head bins in symlog space")
+
     # loss weights
     p.add_argument("--w_dynamics", type=float, default=1.0)
     p.add_argument("--w_bc", type=float, default=1.0)
     p.add_argument("--w_reward", type=float, default=1.0)
-
+    
     # optim
     p.add_argument("--lr", type=float, default=1e-4, help="LR for heads + task embedder")
     p.add_argument("--lr_dynamics", type=float, default=1e-4, help="LR for dynamics (lower, since pre-trained)")
@@ -1193,10 +1256,18 @@ if __name__ == "__main__":
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--grad_clip", type=float, default=1.0)
 
+    # extra training stabilization
+    p.add_argument("--bc_rew_warmup", type=int, default=0) # train only heads to stabilize (?)
+    p.add_argument("--rms_decay", type=float, default=0.99,
+                   help="EMA decay for RMS loss normalization. Set to 1.0 to disable decay (static normalization).")
+    p.add_argument("--clip_mult", type=float, default=5.0,
+                   help="Loss clipping multiplier relative to RMS EMA (e.g. 5 = clip at 5x running avg).")
+
+
     # eval / viz
     p.add_argument("--eval_every", type=int, default=1_000,
                    help="Run BC + dynamics eval every N steps. 0 to disable.")
-    p.add_argument("--eval_batch_size", type=int, default=8,
+    p.add_argument("--eval_batch_size", type=int, default=24,
                    help="Batch size for eval (subset of training batch).")
     p.add_argument("--eval_ctx", type=int, default=8,
                    help="Context length for dynamics autoregressive eval.")
