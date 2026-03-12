@@ -900,6 +900,9 @@ def train(args):
     rms_ema = {"dyn": 1.0, "bc": 1.0, "rew": 1.0}
     rms_decay = 0.99
 
+    # Source IDs that correspond to expert data — computed once, used every step
+    expert_src_ids = {i for i, name in source_id_to_name.items() if name == "expert"}
+
     # Training loop
     dyn.train()
     policy.train()
@@ -982,7 +985,6 @@ def train(args):
 
 
                     # 3) BC loss — only on expert data
-                    expert_src_ids = {i for i, name in source_id_to_name.items() if "expert" in name}
                     expert_mask = torch.zeros(source_id.shape[0], device=device)
                     for _sid in expert_src_ids:
                         expert_mask = expert_mask + (source_id == _sid).float()

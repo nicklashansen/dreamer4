@@ -39,7 +39,7 @@ from model import (
     Encoder, Decoder, Tokenizer, Dynamics, TaskEmbedder,
     temporal_patchify, pack_bottleneck_to_spatial,
 )
-from agent import PolicyHead, RewardHead, ValueHead, compute_lambda_returns, pmpo_loss, ppo_loss, reinforce_loss
+from agent import PolicyHead, RewardHead, ValueHead, compute_lambda_returns, pmpo_loss, ppo_loss, reinforce_loss, _check_head_config
 from train_dynamics import (
     get_dist_info, is_rank0, seed_everything, worker_init_fn,
     init_distributed, load_frozen_tokenizer_from_pt_ckpt,
@@ -74,6 +74,11 @@ def save_ckpt(
         "opt": opt.state_dict(),
         "scaler": scaler.state_dict() if scaler is not None else None,
         "args": vars(args),
+        "action_dim": policy.action_dim,
+        "mtp_length": policy.mtp_length,
+        "val_num_bins": value.num_bins,
+        "val_low": value.low,
+        "val_high": value.high,
     }
     tmp = path.with_suffix(".tmp")
     torch.save(obj, tmp)
@@ -89,6 +94,8 @@ def load_ckpt(
     scaler,
 ) -> tuple:
     ckpt = torch.load(path, map_location="cpu")
+    _check_head_config(policy, ckpt, "policy")
+    _check_head_config(value, ckpt, "val")
     policy.load_state_dict(ckpt["policy"], strict=True)
     value.load_state_dict(ckpt["value"], strict=True)
     opt.load_state_dict(ckpt["opt"])
@@ -134,6 +141,9 @@ def load_finetuned_dynamics(
     action_dim = _resolved_int("action_dim", 16)
     mtp_length = _resolved_int("mtp_length", 8)
     head_hidden = int(d_model * _resolved_float("head_mlp_ratio", 2.0))
+    rw_num_bins = _resolved_int("rw_num_bins", 101)
+    rw_low = _resolved_float("rw_low", 0.0)
+    rw_high = _resolved_float("rw_high", 1.25)
 
     if n_latents % packing_factor != 0:
         raise ValueError(
@@ -208,6 +218,7 @@ def load_finetuned_dynamics(
         hidden=head_hidden,
         mtp_length=mtp_length,
     ).to(device)
+    _check_head_config(policy, ckpt, "policy")
     policy.load_state_dict(ckpt["policy"], strict=True)
 
     # Reward
@@ -215,7 +226,11 @@ def load_finetuned_dynamics(
         d_model=d_model,
         hidden=head_hidden,
         mtp_length=mtp_length,
+        num_bins=rw_num_bins,
+        low=rw_low,
+        high=rw_high,
     ).to(device)
+    _check_head_config(reward_head, ckpt, "rw")
     reward_head.load_state_dict(ckpt["reward"], strict=True)
 
     info = {
@@ -234,6 +249,9 @@ def load_finetuned_dynamics(
         "action_dim": action_dim,
         "mtp_length": mtp_length,
         "head_hidden": head_hidden,
+        "rw_num_bins": rw_num_bins,
+        "rw_low": rw_low,
+        "rw_high": rw_high,
         "ckpt_args": a,
     }
     return dyn, task_embedder, policy, reward_head, info
@@ -430,6 +448,9 @@ def train(args):
         tasks=args.tasks if args.tasks else TASK_SET,
         verbose=is_rank0(),
     )
+    # Map source_id (int) -> short dataset name (basename of data_dir)
+    source_id_to_name = {i: os.path.basename(dd) for i, (dd, _) in enumerate(dataset.sources)}
+
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
     loader = DataLoader(
         dataset,
@@ -529,6 +550,9 @@ def train(args):
     value_head = ValueHead(
         d_model=d_model,
         hidden=head_hidden,
+        num_bins=args.val_num_bins,
+        low=args.val_low,
+        high=args.val_high,
     ).to(device)
 
     if args.compile:
@@ -920,6 +944,17 @@ if __name__ == "__main__":
     p.add_argument("--action_dim", type=int, default=16)
     p.add_argument("--mtp_length", type=int, default=8)
     p.add_argument("--head_mlp_ratio", type=float, default=2.0)
+    # reward head config (loaded from phase2 ckpt args; override only if needed)
+    p.add_argument("--rw_num_bins", type=int, default=11)
+    p.add_argument("--rw_low", type=float, default=0.0)
+    p.add_argument("--rw_high", type=float, default=1.25)
+    # value head config (fresh head trained in phase 3)
+    p.add_argument("--val_num_bins", type=int, default=101,
+                   help="Number of TwoHot bins for value head")
+    p.add_argument("--val_low", type=float, default=-1.0,
+                   help="Lower bound of value head bins in symlog space")
+    p.add_argument("--val_high", type=float, default=9.0,
+                   help="Upper bound of value head bins in symlog space")
 
     # shortcut schedule
     p.add_argument("--k_max", type=int, default=8)
