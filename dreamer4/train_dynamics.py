@@ -956,7 +956,7 @@ if __name__ == "__main__":
     ])
     p.add_argument("--tasks_json", type=str, default="../tasks.json")  # task metadata
     p.add_argument("--seq_len", type=int, default=32)
-    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--batch_size", type=int, default=24)
 
     # tokenizer restore
