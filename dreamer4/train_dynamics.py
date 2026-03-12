@@ -184,6 +184,7 @@ def dynamics_pretrain_loss(
     step: int,
     bootstrap_start: int,
     agent_tokens: Optional[torch.Tensor] = None,
+    diffusion_mask: Optional[torch.Tensor] = None,  # (B,) float: 1=non-expert, 0=expert; None=no masking is one interpretation
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     device = z1.device
     B, T = z1.shape[:2]
@@ -226,7 +227,12 @@ def dynamics_pretrain_loss(
     z1_hat_self = z1_hat_full[B_emp:]
 
     flow_per = (z1_hat_emp.float() - z1[:B_emp].float()).pow(2).mean(dim=(2, 3))  # (B_emp,T)
-    loss_emp = (flow_per * w_emp).mean()
+    if diffusion_mask is not None:
+        nm_emp = diffusion_mask[:B_emp].to(device).float()  # (B_emp,)
+        n_ne_emp = nm_emp.sum().clamp(min=1e-6)
+        loss_emp = (flow_per * w_emp * nm_emp[:, None]).sum() / (n_ne_emp * T)
+    else:
+        loss_emp = (flow_per * w_emp).mean()
 
     boot_mse = torch.zeros((), device=device, dtype=torch.float32)
     loss_self = torch.zeros((), device=device, dtype=torch.float32)
@@ -249,8 +255,14 @@ def dynamics_pretrain_loss(
         vbar_target = ((b_prime + b_doubleprime) / 2.0).detach()
 
         boot_per = (1.0 - sigma_self).pow(2) * (vhat_sigma - vbar_target).pow(2).mean(dim=(2, 3))  # (B_self,T)
-        loss_self = (boot_per * w_self).mean()
-        boot_mse = boot_per.mean()
+        if diffusion_mask is not None:
+            nm_self = diffusion_mask[B_emp:].to(device).float()  # (B_self,)
+            n_ne_self = nm_self.sum().clamp(min=1e-6)
+            loss_self = (boot_per * w_self * nm_self[:, None]).sum() / (n_ne_self * T)
+            boot_mse = (boot_per * nm_self[:, None]).sum() / (n_ne_self * T)
+        else:
+            loss_self = (boot_per * w_self).mean()
+            boot_mse = boot_per.mean()
 
     # Combine losses
     loss = ((loss_emp * (B - B_self)) + (loss_self * B_self)) / B
@@ -610,6 +622,8 @@ def train(args):
             worker_init_fn=worker_init_fn,
             collate_fn=collate_batch,
         )
+        source_id_to_name = {i: os.path.basename(dd) for i, (dd, _) in enumerate(dataset.sources)}
+        expert_src_ids = {i for i, name in source_id_to_name.items() if name == "expert"}
     else:
         dataset = ShardedFrameDataset(
             outdirs=args.frame_dirs,
@@ -628,6 +642,8 @@ def train(args):
             persistent_workers=(args.num_workers > 0),
             worker_init_fn=worker_init_fn,
         )
+        source_id_to_name = {}
+        expert_src_ids = set()
 
     # Load frozen tokenizer
     tok_override = {}
@@ -724,9 +740,10 @@ def train(args):
                     break
 
                 if args.use_actions:
-                    obs_u8 = batch["obs"].to(device, non_blocking=True)          # (B,T+1,3,H,W) uint8
-                    act    = batch["act"].to(device, non_blocking=True)          # (B,T,16) float
-                    mask   = batch["act_mask"].to(device, non_blocking=True)     # (B,T,16) float (optional but good)
+                    obs_u8    = batch["obs"].to(device, non_blocking=True)       # (B,T+1,3,H,W) uint8
+                    act       = batch["act"].to(device, non_blocking=True)       # (B,T,16) float
+                    mask      = batch["act_mask"].to(device, non_blocking=True)  # (B,T,16) float
+                    source_id = batch["source_id"].to(device, non_blocking=True) # (B,) long
 
                     act = act.clamp(-1, 1) * mask
 
@@ -740,6 +757,7 @@ def train(args):
                     frames = batch.to(device, non_blocking=True)                 # (B,T,3,H,W)
                     actions = None
                     act_mask = None
+                    source_id = None
 
                 # Safeguard: convert to [0, 1] if dataset returns uint8
                 if frames.dtype == torch.uint8:
@@ -758,6 +776,25 @@ def train(args):
                 B_self = int(round(args.self_fraction * B))
                 B_self = max(0, min(B - 1, B_self))
 
+                # Non-expert mask: 1.0 for non-expert rows, 0.0 for expert rows
+                # When source_id is unavailable (ShardedFrameDataset), all rows are treated as non-expert
+                if source_id is not None and expert_src_ids:
+                    expert_mask = torch.zeros(B, device=device)
+                    for _sid in expert_src_ids:
+                        expert_mask = expert_mask + (source_id == _sid).float()
+                    expert_mask = expert_mask.clamp(max=1.0)
+                    nonexpert_mask = 1.0 - expert_mask
+                else:
+                    nonexpert_mask = None
+
+                # Masking expert rows from the diffusion loss avoids optimistic generations:
+                # a world model trained on expert data learns to hallucinate expert-quality
+                # transitions, causing imagination rollouts to be unrealistically good. 
+                if args.mask_expert_diffusion_loss:
+                    diffusion_mask = nonexpert_mask  # may be None if no expert sources present
+                else:
+                    diffusion_mask = None  # no masking: all rows contribute equally
+
                 with autocast(device_type="cuda", enabled=use_amp):
                     loss, aux = dynamics_pretrain_loss(
                         dyn.module if hasattr(dyn, "module") else dyn,
@@ -769,6 +806,7 @@ def train(args):
                         step=step,
                         bootstrap_start=args.bootstrap_start,
                         agent_tokens=None,
+                        diffusion_mask=diffusion_mask,
                     )
 
                 if not torch.isfinite(loss):
@@ -842,6 +880,7 @@ def train(args):
                                 step=step,
                                 bootstrap_start=args.bootstrap_start,
                                 agent_tokens=None,
+                                diffusion_mask=diffusion_mask,
                             )
                             perm = torch.randperm(actions.shape[0], device=actions.device)
                             loss_shuffled, _ = dynamics_pretrain_loss(
@@ -854,6 +893,7 @@ def train(args):
                                 step=step,
                                 bootstrap_start=args.bootstrap_start,
                                 agent_tokens=None,
+                                diffusion_mask=diffusion_mask,
                             )
                         action_shuffle_loss_ratio = loss_shuffled / loss
                     else:
@@ -944,8 +984,9 @@ if __name__ == "__main__":
     p.add_argument("--bootstrap_start", type=int, default=5_000)
     p.add_argument("--self_fraction", type=float, default=0.25)
 
-    # actions
+    # actions and data filters
     p.add_argument("--use_actions", action="store_true") # specified as true in github/pretrained
+    p.add_argument("--mask_expert_diffusion_loss", action="store_true") # specified as true in github/pretrained
 
     # optim
     p.add_argument("--lr", type=float, default=1e-4)

@@ -957,8 +957,23 @@ def train(args):
                 B_self = int(round(args.self_fraction * B))
                 B_self = max(0, min(B - 1, B_self))
 
+                # Expert mask: 1.0 for expert rows, 0.0 for non-expert
+                expert_mask = torch.zeros(source_id.shape[0], device=device)
+                for _sid in expert_src_ids:
+                    expert_mask = expert_mask + (source_id == _sid).float()
+                expert_mask = expert_mask.clamp(max=1.0)
+                nonexpert_mask = 1.0 - expert_mask  # dynamics trains on non-expert only
+
+                # Masking expert rows from the diffusion loss avoids optimistic generations:
+                # a world model trained on expert data learns to hallucinate expert-quality
+                # transitions, causing imagination rollouts to be unrealistically good.
+                if args.mask_expert_diffusion_loss:
+                    diffusion_mask = nonexpert_mask  # train dynamics on non-expert rows only
+                else:
+                    diffusion_mask = None  # no masking: all rows contribute equally
+
                 with autocast(device_type="cuda", enabled=use_amp):
-                    # 1) Dynamics shortcut/flow loss (same as pretraining)
+                    # 1) Dynamics shortcut/flow loss — non-expert rows only
                     dyn_loss, dyn_aux = dynamics_pretrain_loss(
                         dyn.module if hasattr(dyn, "module") else dyn,
                         z1=z1,
@@ -969,6 +984,7 @@ def train(args):
                         step=step,
                         bootstrap_start=args.bootstrap_start,
                         agent_tokens=agent_tokens,
+                        diffusion_mask=diffusion_mask,
                     )
 
                     # 2) Use h_t from the dynamics forward pass (noisy inputs)
@@ -985,11 +1001,6 @@ def train(args):
 
 
                     # 3) BC loss — only on expert data
-                    expert_mask = torch.zeros(source_id.shape[0], device=device)
-                    for _sid in expert_src_ids:
-                        expert_mask = expert_mask + (source_id == _sid).float()
-                    expert_mask = expert_mask.clamp(max=1.0)
-
                     bc_l, bc_aux = bc_loss(
                         policy, h_pooled, act, mask,
                         action_dim=args.action_dim,
@@ -1249,9 +1260,12 @@ if __name__ == "__main__":
     p.add_argument("--w_dynamics", type=float, default=1.0)
     p.add_argument("--w_bc", type=float, default=1.0)
     p.add_argument("--w_reward", type=float, default=1.0)
+
+    # data filter
+    p.add_argument("--mask_expert_diffusion_loss", action="store_true") # specified as true in github/pretrained
     
     # optim
-    p.add_argument("--lr", type=float, default=1e-4, help="LR for heads + task embedder")
+    p.add_argument("--lr", type=float, default=1e-5, help="LR for heads + task embedder")
     p.add_argument("--lr_dynamics", type=float, default=1e-4, help="LR for dynamics (lower, since pre-trained)")
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--max_steps", type=int, default=100_000)
