@@ -1265,7 +1265,7 @@ if __name__ == "__main__":
     p.add_argument("--mask_expert_diffusion_loss", action="store_true") # specified as true in github/pretrained
     
     # optim
-    p.add_argument("--lr", type=float, default=1e-5, help="LR for heads + task embedder")
+    p.add_argument("--lr", type=float, default=1e-4, help="LR for heads + task embedder")
     p.add_argument("--lr_dynamics", type=float, default=1e-4, help="LR for dynamics (lower, since pre-trained)")
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--max_steps", type=int, default=100_000)
