@@ -19,6 +19,7 @@ from task_set import TASK_SET
 from model import (
     Encoder, Decoder, Tokenizer, Dynamics, TaskEmbedder,
     temporal_patchify, temporal_unpatchify,
+    denoise_one_step,
 )
 from agent import PolicyHead, RewardHead, ValueHead
 
@@ -86,77 +87,6 @@ def make_tau_schedule(*, k_max: int, schedule: str = "finest", d: Optional[float
     tau_idx = [i * stride for i in range(K)]
     return {"K": K, "e": e, "dt": dt, "tau": tau, "tau_idx": tau_idx}
 
-
-@torch.inference_mode()
-def sample_one_timestep_packed(
-    dyn: Dynamics,
-    *,
-    past_packed: torch.Tensor,                 # (B,t,n_spatial,d_spatial)
-    k_max: int,
-    sched: Dict[str, Any],
-    actions: Optional[torch.Tensor] = None,    # (B,t+1,A) (action[0]=0)
-    act_mask: Optional[torch.Tensor] = None,   # (B,t+1,A) or (A,)
-    agent_tokens: Optional[torch.Tensor] = None,  # (B,t+1,n_agent,d_model) or None
-    use_amp: bool = True,
-) -> torch.Tensor:
-    """
-    Generate next packed latent z_t: (B,n_spatial,d_spatial) given past length t.
-
-    Returns:
-        z: (B, n_spatial, d_spatial)
-        h_t: (B, n_agent, d_model) or None — agent tokens from last denoising step
-    """
-    device = past_packed.device
-    dtype = past_packed.dtype
-    B, t = past_packed.shape[:2]
-    n_spatial, d_spatial = past_packed.shape[2], past_packed.shape[3]
-
-    K = int(sched["K"])
-    e = int(sched["e"])
-    tau = sched["tau"]
-    tau_idx = sched["tau_idx"]
-    dt = float(sched["dt"])
-
-    # tau=0 init
-    z = torch.randn((B, 1, n_spatial, d_spatial), device=device, dtype=dtype)
-
-    emax = int(round(math.log2(int(k_max))))
-    step_idxs_full = torch.full((B, t + 1), emax, device=device, dtype=torch.long)
-    step_idxs_full[:, -1] = e
-
-    signal_idxs_full = torch.full((B, t + 1), k_max - 1, device=device, dtype=torch.long)
-
-    if act_mask is not None and act_mask.dim() == 1:
-        act_mask = act_mask.view(1, 1, -1).expand(B, t + 1, -1)
-
-    actions_in = None if actions is None else actions[:, : t + 1]
-    actmask_in = None if act_mask is None else act_mask[:, : t + 1]
-
-    for i in range(K):
-        tau_i = float(tau[i])
-        sig_i = int(tau_idx[i])
-
-        signal_idxs_full[:, -1] = sig_i
-        packed_seq = torch.cat([past_packed, z], dim=1)
-
-        with torch.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
-            x1_hat_full, h_t_full = dyn(
-                actions_in,
-                step_idxs_full,
-                signal_idxs_full,
-                packed_seq,
-                act_mask=actmask_in,
-                agent_tokens=agent_tokens,
-            )
-
-        x1_hat = x1_hat_full[:, -1:, :, :]
-        denom = max(1e-4, 1.0 - tau_i)
-        b = (x1_hat.float() - z.float()) / denom
-        z = (z.float() + b * dt).to(dtype)
-
-    # h_t from the last denoising step
-    h_t_out = h_t_full[:, -1] if h_t_full is not None else None  # (B, n_agent, d_model)
-    return z[:, 0], h_t_out  # (B,n_spatial,d_spatial), (B,n_agent,d_model)|None
 
 
 def load_task_action_dim(tasks_json: str, task: str, *, default_dim: int = 16) -> int:
@@ -529,6 +459,9 @@ class SessionState:
 
     autopilot: bool
 
+    current_reward: float
+    cumulative_reward: float
+
     cached_frame_id: int
     cached_jpeg: Optional[bytes]
 
@@ -666,6 +599,8 @@ class InteractiveServer:
             ctx_window=int(self.args.ctx_window),
             fps=float(self.args.fps),
             autopilot=self.policy is not None,
+            current_reward=0.0,
+            cumulative_reward=0.0,
             cached_frame_id=-1,
             cached_jpeg=None,
         )
@@ -686,6 +621,8 @@ class InteractiveServer:
         st.reset_requested = False
         st.step = 0
         st.last_action_val = 0.0
+        st.current_reward = 0.0
+        st.cumulative_reward = 0.0
         st.cached_frame_id = -1
         st.cached_jpeg = None
 
@@ -707,6 +644,8 @@ class InteractiveServer:
         st.reset_requested = False
         st.step = 0
         st.last_action_val = 0.0
+        st.current_reward = 0.0
+        st.cumulative_reward = 0.0
 
         st.cached_frame_id = -1
         st.cached_jpeg = None
@@ -816,7 +755,7 @@ class InteractiveServer:
             past, actions_local, actmask_local = self._build_local_window(st)
             agent_tokens = self._make_agent_tokens(actions_local.shape[1], st.task)
 
-            z_next, _ = sample_one_timestep_packed(
+            z_next, h_t_out = denoise_one_step(
                 self.dyn,
                 past_packed=past,
                 k_max=self.k_max,
@@ -828,6 +767,13 @@ class InteractiveServer:
             )
             st.z_hist.append(_as_2d_packed(z_next.detach()))
             st.step += 1
+
+            # Predict reward for the current frame (zero extra cost — h_t already computed)
+            if self.reward_head is not None and h_t_out is not None:
+                h_rew = h_t_out[:, :1, :]  # (1, 1, d_model)
+                r = float(self.reward_head.predict(h_rew, step=0).item())
+                st.current_reward = r
+                st.cumulative_reward += r
 
         frame_id = len(st.z_hist) - 1  # stable identifier for "current displayed frame"
         need_encode = (st.cached_jpeg is None) or (st.cached_frame_id != frame_id)
@@ -849,17 +795,23 @@ class InteractiveServer:
             jpeg = None
 
         mode = "autopilot" if st.autopilot else "manual"
+        rew_str = ""
+        if self.reward_head is not None:
+            rew_str = f" | r={st.current_reward:.3f} R={st.cumulative_reward:.1f}"
         status = {
             "type": "status",
             "task": st.task,
             "paused": bool(st.paused),
             "autopilot": bool(st.autopilot),
             "has_policy": self.policy is not None,
+            "reward": st.current_reward,
+            "cumulative_reward": st.cumulative_reward,
             "text": (
                 f"step={st.step} | "
                 f"dim={st.selected_dim}/{max(st.act_dim - 1, 0)} | "
                 f"a={st.last_action_val:+.1f} | "
                 f"{mode} | fps={st.fps:.1f}"
+                f"{rew_str}"
             ),
         }
         return jpeg, status

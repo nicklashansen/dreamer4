@@ -2,7 +2,7 @@
 import math
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Optional, Tuple, Dict
+from typing import Any, Optional, Tuple, Dict
 
 import torch
 import torch.nn as nn
@@ -729,3 +729,62 @@ def lpips_on_mae_recon(
     with torch.autocast(device_type="cuda", enabled=False):
         lp = lpips_fn(recon, tgt)
     return lp.mean()
+
+
+@torch.no_grad()
+def denoise_one_step(
+    dyn: "Dynamics",
+    *,
+    past_packed: torch.Tensor,                    # (B, t, n_spatial, d_spatial)
+    k_max: int,
+    sched: Dict[str, Any],
+    actions: Optional[torch.Tensor] = None,       # (B, t+1, A)
+    act_mask: Optional[torch.Tensor] = None,      # (B, t+1, A) or (A,)
+    agent_tokens: Optional[torch.Tensor] = None,  # (B, t+1, n_agent, d_model)
+    use_amp: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Denoise one future latent given past context.
+
+    Returns:
+        z: (B, n_spatial, d_spatial) — denoised next latent
+        h_t: (B, n_agent, d_model) or None — agent hidden from last denoising step
+    """
+    device = past_packed.device
+    dtype = past_packed.dtype
+    B, t = past_packed.shape[:2]
+    n_spatial, d_spatial = past_packed.shape[2], past_packed.shape[3]
+
+    K = int(sched["K"])
+    e = int(sched["e"])
+    tau = sched["tau"]
+    tau_idx = sched["tau_idx"]
+    dt = float(sched["dt"])
+
+    z = torch.randn((B, 1, n_spatial, d_spatial), device=device, dtype=dtype)
+
+    emax = int(round(math.log2(int(k_max))))
+    step_idxs = torch.full((B, t + 1), emax, device=device, dtype=torch.long)
+    step_idxs[:, -1] = e
+    signal_idxs = torch.full((B, t + 1), k_max - 1, device=device, dtype=torch.long)
+
+    if act_mask is not None and act_mask.dim() == 1:
+        act_mask = act_mask.view(1, 1, -1).expand(B, t + 1, -1)
+
+    actions_in = None if actions is None else actions[:, :t + 1]
+    actmask_in = None if act_mask is None else act_mask[:, :t + 1]
+
+    h_t_full = None
+    for i in range(K):
+        signal_idxs[:, -1] = int(tau_idx[i])
+        packed_seq = torch.cat([past_packed, z], dim=1)
+        with torch.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
+            x1_hat_full, h_t_full = dyn(
+                actions_in, step_idxs, signal_idxs, packed_seq,
+                act_mask=actmask_in, agent_tokens=agent_tokens,
+            )
+        x1_hat = x1_hat_full[:, -1:, :, :]
+        denom = max(1e-4, 1.0 - float(tau[i]))
+        z = (z.float() + (x1_hat.float() - z.float()) / denom * dt).to(dtype)
+
+    h_t_out = h_t_full[:, -1] if h_t_full is not None else None
+    return z[:, 0], h_t_out

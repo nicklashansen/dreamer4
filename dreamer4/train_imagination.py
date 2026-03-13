@@ -38,6 +38,7 @@ from wm_dataset import WMDataset, collate_batch
 from model import (
     Encoder, Decoder, Tokenizer, Dynamics, TaskEmbedder,
     temporal_patchify, pack_bottleneck_to_spatial,
+    denoise_one_step,
 )
 from agent import PolicyHead, RewardHead, ValueHead, compute_lambda_returns, pmpo_loss, ppo_loss, reinforce_loss, _check_head_config
 from train_dynamics import (
@@ -298,11 +299,6 @@ def imagine_rollout(
     # Using the unshifted mask avoids the all-zeros pi_mask bug.
     pi_mask = task_act_mask[:, 0, :action_dim].unsqueeze(1)  # (B, 1, action_dim)
 
-    K = int(sched["K"])
-    e = int(sched["e"])
-    tau_sched = sched["tau"]
-    tau_idx_sched = sched["tau_idx"]
-    dt = float(sched["dt"])
     emax = int(round(math.log2(k_max)))
 
     h_states = []
@@ -367,45 +363,20 @@ def imagine_rollout(
         am_ext = torch.cat([am_hist, full_act_mask], dim=1)             # (B, t+1, 16)
         ag_ext = torch.cat([ag_hist, ag_hist[:, -1:]], dim=1)           # (B, t+1, n_agent, d_model)
 
-        # --- Denoise z_{s+1} (K steps, no grad) ---
-        z = torch.randn((B, 1, n_spatial, d_spatial), device=device, dtype=dtype)
-        step_idxs_den = torch.full((B, t + 1), emax, device=device, dtype=torch.long)
-        step_idxs_den[:, -1] = e
-        signal_idxs_den = torch.full((B, t + 1), k_max - 1, device=device, dtype=torch.long)
-
-        with torch.no_grad():
-            for i in range(K):
-                sig_i = int(tau_idx_sched[i])
-                signal_idxs_den[:, -1] = sig_i
-                packed_seq = torch.cat([z_hist, z], dim=1)
-                with autocast(device_type="cuda", enabled=use_amp):
-                    x1_hat_full, _ = dyn(
-                        a_ext, step_idxs_den, signal_idxs_den, packed_seq,
-                        act_mask=am_ext,
-                        agent_tokens=ag_ext,
-                    )
-                tau_i = float(tau_sched[i])
-                x1_hat = x1_hat_full[:, -1:, :, :]
-                denom = max(1e-4, 1.0 - tau_i)
-                z = (z.float() + (x1_hat.float() - z.float()) / denom * dt).to(dtype)
-
-        # --- Clean forward on history + z_{s+1} → h_{s+1} ---
-        # h_{s+1} becomes h_prev for the next step, and after the final step it
-        # is the bootstrap state for the last value prediction.
-        # After the final step, h_prev = h_H is the bootstrap state, so no
-        # extra dynamics forward is needed for the bootstrap value either.
+        # --- Denoise z_{s+1} and get h_{s+1} from last denoising step ---
+        z_next, h_denoise = denoise_one_step(
+            dyn,
+            past_packed=z_hist,
+            k_max=k_max,
+            sched=sched,
+            actions=a_ext,
+            act_mask=am_ext,
+            agent_tokens=ag_ext,
+            use_amp=use_amp,
+        )
+        z = z_next.unsqueeze(1)  # (B, 1, n_spatial, d_spatial)
+        h_prev = h_denoise.mean(dim=-2)  # (B, d_model) — pool n_agent dim
         z_hist_new = torch.cat([z_hist, z.detach()], dim=1)
-        step_idxs_clean = torch.full((B, t + 1), emax, device=device, dtype=torch.long)
-        signal_idxs_clean = torch.full((B, t + 1), k_max - 1, device=device, dtype=torch.long)
-
-        with torch.no_grad():
-            with autocast(device_type="cuda", enabled=use_amp):
-                _, h_new = dyn(
-                    a_ext, step_idxs_clean, signal_idxs_clean, z_hist_new,
-                    act_mask=am_ext,
-                    agent_tokens=ag_ext,
-                )
-        h_prev = h_new.mean(dim=2)[:, -1]  # (B, d_model) = h_{s+1}
 
         # --- Trim and carry forward histories ---
         z_hist = z_hist_new[:, -max_ctx:]
@@ -413,7 +384,7 @@ def imagine_rollout(
         am_hist = am_ext[:, -max_ctx:]
         ag_hist = ag_ext[:, -max_ctx:]
 
-    # Bootstrap value: h_prev is already h_H from the last clean forward — no extra pass.
+    # Bootstrap value: h_prev is already h_H from the last denoising step.
     with autocast(device_type="cuda", enabled=use_amp):
         v_boot = value_head.predict(h_prev.unsqueeze(1))[:, 0]
     values_list.append(v_boot)
