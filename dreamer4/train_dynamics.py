@@ -925,7 +925,7 @@ def train(args):
                     )
 
                 # Checkpointing
-                if is_rank0() and args.save_every > 0 and (step % args.save_every == 0) and do_step:
+                if is_rank0() and args.save_every > 0 and (step % args.save_every == 0):
                     ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
                     save_ckpt(ckpt_path, step=step, epoch=epoch, dyn_model=dyn, opt=opt, scaler=scaler, args=args)
                     latest = ckpt_dir / "latest.pt"
