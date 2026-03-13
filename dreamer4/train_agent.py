@@ -1127,6 +1127,7 @@ def train(args):
                         sched=sched,
                         max_items=args.eval_batch_size,
                         step=step,
+                        ctx_renoise_idx=args.ctx_renoise_idx,
                     )
 
                 if is_rank0():
@@ -1293,6 +1294,15 @@ if __name__ == "__main__":
                    help="Denoising schedule for dynamics eval rollout.")
     p.add_argument("--eval_d", type=float, default=0.25,
                    help="Step size d for shortcut schedule during eval.")
+    p.add_argument(
+        "--ctx_renoise_idx",
+        type=int,
+        default=-1,
+        help=(
+            "Context renoise signal index for inference-only dynamics eval. "
+            "-1=disable; 0=full noise; k_max-1=slightest noising (noise fraction 1/k_max)."
+        ),
+    )
 
     # logging
     p.add_argument("--log_every", type=int, default=100)

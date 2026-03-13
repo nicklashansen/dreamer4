@@ -277,6 +277,7 @@ def imagine_rollout(
     k_max: int,
     sched: dict,
     action_dim: int,
+    ctx_renoise_idx: int = -1,
     use_amp: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """Run imagined rollout for `horizon` steps from encoded context.
@@ -372,6 +373,7 @@ def imagine_rollout(
             actions=a_ext,
             act_mask=am_ext,
             agent_tokens=ag_ext,
+            ctx_renoise_idx=ctx_renoise_idx,
             use_amp=use_amp,
         )
         z = z_next.unsqueeze(1)  # (B, 1, n_spatial, d_spatial)
@@ -478,6 +480,11 @@ def train(args):
     action_dim = p2_info["action_dim"]
     mtp_length = p2_info["mtp_length"]
     head_hidden = p2_info["head_hidden"]
+
+    if args.ctx_renoise_idx < -1 or args.ctx_renoise_idx > k_max - 1:
+        raise ValueError(
+            f"--ctx_renoise_idx must be in [-1, {k_max - 1}], got {args.ctx_renoise_idx}"
+        )
 
     # --- Robustness checks: args / phase2 alignment ---
     runtime_vs_loaded = (
@@ -651,6 +658,7 @@ def train(args):
                     k_max=k_max,
                     sched=sched,
                     action_dim=action_dim,
+                    ctx_renoise_idx=args.ctx_renoise_idx,
                     use_amp=use_amp,
                 )
 
@@ -937,6 +945,15 @@ if __name__ == "__main__":
     p.add_argument("--horizon", type=int, default=32)
     p.add_argument("--imagination_d", type=float, default=0.25,
                    help="Shortcut d for denoising in imagination (K = 1/d steps)")
+    p.add_argument(
+        "--ctx_renoise_idx",
+        type=int,
+        default=-1,
+        help=(
+            "Context renoise signal index for inference-only imagination denoising. "
+            "-1=disable; 0=full noise; k_max-1=slightest noising (noise fraction 1/k_max)."
+        ),
+    )
     p.add_argument("--gamma", type=float, default=0.997) # core hparam
     p.add_argument("--lam", type=float, default=0.95) # core hparam
 

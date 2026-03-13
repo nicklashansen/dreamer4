@@ -507,6 +507,11 @@ class InteractiveServer:
         self.n_spatial = int(dyn_info["n_spatial"])
         self.d_spatial = int(dyn_info["d_spatial"])
 
+        if args.ctx_renoise_idx < -1 or args.ctx_renoise_idx > self.k_max - 1:
+            raise ValueError(
+                f"--ctx_renoise_idx must be in [-1, {self.k_max - 1}], got {args.ctx_renoise_idx}"
+            )
+
         self.sched = make_tau_schedule(
             k_max=self.k_max,
             schedule=args.schedule,
@@ -763,6 +768,7 @@ class InteractiveServer:
                 actions=actions_local,
                 act_mask=actmask_local,
                 agent_tokens=agent_tokens,
+                ctx_renoise_idx=self.args.ctx_renoise_idx,
                 use_amp=self.use_amp,
             )
             st.z_hist.append(_as_2d_packed(z_next.detach()))
@@ -948,7 +954,16 @@ def main():
     p.add_argument("--packing_factor", type=int, default=2)
     p.add_argument("--ctx_window", type=int, default=24)
     p.add_argument("--schedule", type=str, default="shortcut", choices=["finest", "shortcut"])
-    p.add_argument("--eval_d", type=float, default=0.5)
+    p.add_argument("--eval_d", type=float, default=0.25)
+    p.add_argument(
+        "--ctx_renoise_idx",
+        type=int,
+        default=-1,
+        help=(
+            "Context renoise signal index for inference-only rollout. "
+            "-1=disable; 0=full noise; k_max-1=slightest noising (noise fraction 1/k_max)."
+        ),
+    )
     p.add_argument("--amp", action="store_true")
     p.add_argument("--jpeg_quality", type=int, default=95)
     p.add_argument("--action_smooth_beta", type=float, default=0.817)

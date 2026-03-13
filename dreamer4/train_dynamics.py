@@ -325,6 +325,7 @@ def sample_one_timestep_packed(
     sched: Dict[str, Any],
     actions: Optional[torch.Tensor] = None,     # (B,T,A) aligned to frames or None
     act_mask: Optional[torch.Tensor] = None,    # (B,T,A) or (A,) or None
+    ctx_renoise_idx: int = -1,                  # -1 disables; [0, k_max-1] enables context renoise
 ) -> torch.Tensor:
     device = past_packed.device
     dtype = past_packed.dtype
@@ -346,6 +347,21 @@ def sample_one_timestep_packed(
     step_idxs_full[:, -1] = e  # only the sampled timestep uses the shortcut step
 
     signal_idxs_full = torch.full((B, t + 1), k_max - 1, device=device, dtype=torch.long)
+    ctx_idx = int(ctx_renoise_idx)
+    if ctx_idx < -1 or ctx_idx > int(k_max) - 1:
+        raise ValueError(f"ctx_renoise_idx must be in [-1, {k_max - 1}], got {ctx_renoise_idx}")
+    use_ctx_renoise = ctx_idx >= 0
+    # context may be a temporary noisy tensor
+    if use_ctx_renoise:
+        sigma_ctx = float(ctx_idx) / float(k_max)
+        eps_ctx = torch.randn_like(past_packed)
+        past_noised = ((1.0 - sigma_ctx) * eps_ctx + sigma_ctx * past_packed).to(dtype)
+        signal_idxs_full[:, :-1] = ctx_idx
+        ctx_mask = torch.zeros((B, t + 1, 1, 1), device=device, dtype=torch.bool)
+        ctx_mask[:, :t] = True
+    else:
+        past_noised = past_packed
+        ctx_mask = None
 
     # broadcast (A,) -> (B,T,A) if needed (only if actions are present)
     if act_mask is not None and act_mask.dim() == 1:
@@ -356,7 +372,12 @@ def sample_one_timestep_packed(
         sig_i = int(tau_idx[i])
 
         signal_idxs_full[:, -1] = sig_i
-        packed_seq = torch.cat([past_packed, z], dim=1)  # (B,t+1,...)
+        packed_clean = torch.cat([past_packed, z], dim=1)  # (B,t+1,...)
+        if use_ctx_renoise:
+            packed_noised = torch.cat([past_noised, z], dim=1)
+            packed_seq = torch.where(ctx_mask, packed_noised, packed_clean)
+        else:
+            packed_seq = packed_clean
 
         actions_in = None if actions is None else actions[:, : t + 1]
         actmask_in = None if act_mask is None else act_mask[:, : t + 1]
@@ -389,6 +410,7 @@ def sample_autoregressive_packed_sequence(
     sched: Dict[str, Any],
     actions: Optional[torch.Tensor] = None,     # (B,T,A) or None
     act_mask: Optional[torch.Tensor] = None,    # (B,T,A) or (A,) or None
+    ctx_renoise_idx: int = -1,
 ) -> torch.Tensor:
     B, T = z_gt_packed.shape[:2]
     L = min(T, ctx_length + horizon)
@@ -406,6 +428,7 @@ def sample_autoregressive_packed_sequence(
             sched=sched,
             actions=actions,
             act_mask=act_mask,
+            ctx_renoise_idx=ctx_renoise_idx,
         )
         outs.append(z_next)
 
@@ -488,6 +511,7 @@ def run_dynamics_eval(
     sched: Dict[str, Any],
     max_items: int,
     step: int,
+    ctx_renoise_idx: int = -1,
 ):
     dyn_was_training = dyn.training
     dyn.eval()
@@ -517,6 +541,7 @@ def run_dynamics_eval(
         sched=sched,
         actions=actions_eval,
         act_mask=act_mask_eval,
+        ctx_renoise_idx=ctx_renoise_idx,
     )
 
     pred_frames = decode_packed_to_frames(
@@ -862,6 +887,7 @@ def train(args):
                         sched=sched,
                         max_items=args.eval_max_items,
                         step=step,
+                        ctx_renoise_idx=args.ctx_renoise_idx,
                     )
 
                 # Logging
@@ -1003,6 +1029,15 @@ if __name__ == "__main__":
     p.add_argument("--eval_horizon", type=int, default=16)
     p.add_argument("--eval_schedule", type=str, default="shortcut", choices=["finest", "shortcut"])
     p.add_argument("--eval_d", type=float, default=0.25)
+    p.add_argument(
+        "--ctx_renoise_idx",
+        type=int,
+        default=-1,
+        help=(
+            "Context renoise signal index for inference-only eval rollouts. "
+            "-1=disable; 0=full noise; k_max-1=slightest noising (noise fraction 1/k_max)."
+        ),
+    )
 
     # logging
     p.add_argument("--log_every", type=int, default=200)
