@@ -284,7 +284,7 @@ def imagine_rollout(
         h_states: (B, horizon, d_model) — agent states (detached for policy)
         actions:  (B, horizon, action_dim) — sampled actions (differentiable)
         log_probs: (B, horizon) — log probs of sampled actions
-        rewards:  (B, horizon) — predicted rewards
+        rewards:  (B, horizon) — immediate rewards aligned with h_states / values[:, :-1]
         values:   (B, horizon+1) — predicted values (includes bootstrap)
     """
     device = z_context.device
@@ -336,10 +336,15 @@ def imagine_rollout(
     for step in range(horizon):
         t = z_hist.shape[1]
 
-        # --- Value + policy at current state h_s (= h_prev) ---
+        # --- Value + immediate reward at current state h_s (= h_prev) ---
+        # Phase-2 reward supervision trains reward_head(h_t) against the reward
+        # of the transition leaving s_t, so reward prediction must be taken from
+        # the current state to align TD(lambda) targets with values at h_s.
         with autocast(device_type="cuda", enabled=use_amp):
             v = value_head.predict(h_prev.unsqueeze(1))[:, 0]  # (B,)
+            r = reward_head.predict(h_prev.unsqueeze(1), step=0)[:, 0]  # (B,)
         values_list.append(v)
+        rewards_list.append(r.detach())
 
         # stop_gradient before policy: dynamics state is a fixed feature
         h_detached = h_prev.detach()
@@ -385,10 +390,8 @@ def imagine_rollout(
                 z = (z.float() + (x1_hat.float() - z.float()) / denom * dt).to(dtype)
 
         # --- Clean forward on history + z_{s+1} → h_{s+1} ---
-        # h_{s+1} serves dual purpose:
-        #   (a) reward r_{s+1} = R(h_{s+1})
-        #   (b) h_prev for the next step — avoids a redundant Pass-1 at the top
-        #       of the next iteration (those two calls are identical).
+        # h_{s+1} becomes h_prev for the next step, and after the final step it
+        # is the bootstrap state for the last value prediction.
         # After the final step, h_prev = h_H is the bootstrap state, so no
         # extra dynamics forward is needed for the bootstrap value either.
         z_hist_new = torch.cat([z_hist, z.detach()], dim=1)
@@ -403,10 +406,6 @@ def imagine_rollout(
                     agent_tokens=ag_ext,
                 )
         h_prev = h_new.mean(dim=2)[:, -1]  # (B, d_model) = h_{s+1}
-
-        with autocast(device_type="cuda", enabled=use_amp):
-            r = reward_head.predict(h_prev.unsqueeze(1), step=0)[:, 0]  # (B,)
-        rewards_list.append(r.detach())
 
         # --- Trim and carry forward histories ---
         z_hist = z_hist_new[:, -max_ctx:]
@@ -656,6 +655,8 @@ def train(args):
                 act_mask_shifted[:, 1:] = mask[:, :-1]
 
                 B, T = frames.shape[:2]
+
+                # here, expand over the group dimension (B, ...) --> (B G, ...) 
 
                 # --- Frozen encode ---
                 with torch.no_grad():
@@ -978,6 +979,8 @@ if __name__ == "__main__":
     p.add_argument("--time_normalize_adv", action="store_true",
                    help="Center advantages per-timestep across batch to remove "
                         "structural early-positive/late-negative temporal bias")
+    p.add_argument('--group_size', type=int, default=1)
+
     # PMPO-specific
     p.add_argument("--alpha", type=float, default=0.5,
                    help="[pmpo] sign-split weight (0=rejection only, 1=acceptance only)")

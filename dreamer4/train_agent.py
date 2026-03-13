@@ -313,7 +313,7 @@ def reward_loss(
 ) -> tuple:
     """Reward prediction loss: two-hot CE of dataset rewards.
 
-    MTP: for step l, predict reward at t+l from h_t at time t.
+    MTP: for step l, predict reward at t+l from h_t at time t. note that this is the reward that comes after taking a_t.
 
     Args:
         h_t: (B, T, d_model) — detached agent token outputs
