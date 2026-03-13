@@ -541,13 +541,17 @@ class InteractiveServer:
                 n_agent=self.dyn.n_agent,
             )
             self.policy_action_dim = self.policy.action_dim
-            # Phase 3 checkpoints don't include task_embedder; fall back to dynamics checkpoint
+            # Phase 3 checkpoints don't include task_embedder; fall back to Phase 2 checkpoint
             if self.task_embedder is None and self.dyn.n_agent > 0:
-                _, _, self.task_embedder = load_agent_heads(
-                    args.dynamics_ckpt, self.device,
-                    d_model=self.dyn.d_model,
-                    n_agent=self.dyn.n_agent,
-                )
+                agent_ckpt = torch.load(args.agent_ckpt, map_location="cpu")
+                p2_path = (agent_ckpt.get("args") or {}).get("phase2_ckpt")
+                del agent_ckpt
+                if p2_path and os.path.isfile(p2_path):
+                    _, _, self.task_embedder = load_agent_heads(
+                        p2_path, self.device,
+                        d_model=self.dyn.d_model,
+                        n_agent=self.dyn.n_agent,
+                    )
             self.task_emb_ids = build_task_emb_map(args.agent_ckpt, args.dynamics_ckpt)
             te_str = "yes" if self.task_embedder is not None else "no"
             print(f"[web] loaded policy from {args.agent_ckpt} (action_dim={self.policy_action_dim}, task_emb={te_str}, {len(self.task_emb_ids)} tasks)")
@@ -707,7 +711,9 @@ class InteractiveServer:
         actions_ctx = torch.zeros((1, t, 16), device=self.device, dtype=torch.float32)
         if t >= 2:
             actions_ctx[0, 1:t] = torch.stack(st.a_hist[s + 1: s + t], dim=0)
-        act_mask_ctx = st.act_mask_1d.view(1, 1, 16).expand(1, t, 16)
+        act_mask_ctx = torch.zeros((1, t, 16), device=self.device, dtype=torch.float32)
+        if t >= 2:
+            act_mask_ctx[0, 1:t] = st.act_mask_1d.view(1, 16).expand(t - 1, 16)
 
         agent_tokens = self._make_agent_tokens(t, st.task)
 
@@ -717,8 +723,8 @@ class InteractiveServer:
                 act_mask=act_mask_ctx,
                 agent_tokens=agent_tokens,
             )
-        # h_t_full: (1, t, n_agent, d_model) — take last timestep, first agent token
-        return h_t_full[:, -1:, 0, :]  # (1, 1, d_model)
+        # Match training: pool across agent tokens before passing to the policy head.
+        return h_t_full[:, -1].mean(dim=1, keepdim=True)  # (1, 1, d_model)
 
     def _render_step_sync(self, st: SessionState) -> Tuple[bytes, Dict[str, Any]]:
         """
@@ -732,7 +738,8 @@ class InteractiveServer:
         if st.autopilot and self.policy is not None and not st.paused:
             # Policy-driven: get h_t and sample action
             h_t = self._get_h_t_for_policy(st)  # (1, 1, d_model)
-            action_raw = self.policy.sample(h_t, step=0)[0, 0]  # (action_dim,)
+            policy_mask = st.act_mask_1d[:self.policy_action_dim].view(1, 1, self.policy_action_dim)
+            action_raw = self.policy.sample(h_t, step=0, mask=policy_mask)[0, 0]  # (action_dim,)
             a = torch.zeros(16, device=self.device, dtype=torch.float32)
             a[:self.policy_action_dim] = action_raw[:self.policy_action_dim].clamp(-1, 1)
             a = (a * st.act_mask_1d).to(torch.float32)
@@ -768,7 +775,6 @@ class InteractiveServer:
                 actions=actions_local,
                 act_mask=actmask_local,
                 agent_tokens=agent_tokens,
-                ctx_renoise_idx=self.args.ctx_renoise_idx,
                 use_amp=self.use_amp,
             )
             st.z_hist.append(_as_2d_packed(z_next.detach()))

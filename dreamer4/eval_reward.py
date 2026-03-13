@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from train_imagination import load_phase2
+from train_imagination import load_finetuned_dynamics
 from train_dynamics import load_frozen_tokenizer_from_pt_ckpt
 from model import temporal_patchify, pack_bottleneck_to_spatial
 from wm_dataset import WMDataset, collate_batch
@@ -48,10 +48,11 @@ def main():
     n_spatial = n_latents // args.packing_factor
 
     # Phase 2 checkpoint
-    dyn, te, policy, rh, info = load_phase2(
+    dyn, te, policy, rh, info = load_finetuned_dynamics(
         args.phase2_ckpt, device=device,
         d_bottleneck=d_bottleneck, n_latents=n_latents,
-        packing_factor=args.packing_factor, space_mode_override="wm_agent")
+        packing_factor=args.packing_factor,
+        override={"space_mode": "wm_agent"})
     for m in [dyn, te, rh]:
         m.eval()
     k_max = info["k_max"]

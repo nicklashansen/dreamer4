@@ -373,7 +373,6 @@ def imagine_rollout(
             actions=a_ext,
             act_mask=am_ext,
             agent_tokens=ag_ext,
-            ctx_renoise_idx=ctx_renoise_idx,
             use_amp=use_amp,
         )
         z = z_next.unsqueeze(1)  # (B, 1, n_spatial, d_spatial)
@@ -390,14 +389,27 @@ def imagine_rollout(
     with autocast(device_type="cuda", enabled=use_amp):
         v_boot = value_head.predict(h_prev.unsqueeze(1))[:, 0]
     values_list.append(v_boot)
-
-    return {
+    
+    ret_values = {
         "h_states": torch.stack(h_states, dim=1),    # (B, H, d_model)
         "actions": torch.stack(actions_list, dim=1),  # (B, H, action_dim)
         "log_probs": torch.stack(log_probs_list, dim=1),  # (B, H)
         "rewards": torch.stack(rewards_list, dim=1),  # (B, H)
         "values": torch.stack(values_list, dim=1),    # (B, H+1)
     }
+    # Compact rollout diagnostics — detect action saturation, reward/value issues
+    _a = ret_values["actions"]
+    _lp = ret_values["log_probs"]
+    _r = ret_values["rewards"]
+    _v = ret_values["values"][:, :-1]
+    _sat = (_a.abs() > 0.99).float().mean().item()
+    print(f"  [rollout] act_sat={_sat:.2f} act_std={_a.std(0).mean().item():.3f} "
+          f"lp={_lp.mean().item():.1f}±{_lp.std().item():.1f} "
+          f"r={_r.mean().item():.3f}[{_r.min().item():.2f},{_r.max().item():.2f}] "
+          f"v={_v.mean().item():.3f}[{_v.min().item():.2f},{_v.max().item():.2f}] "
+          f"r-v={(_r - _v).mean().item():+.3f}")
+
+    return ret_values
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +532,7 @@ def train(args):
         action_dim=action_dim,
         hidden=head_hidden,
         mtp_length=mtp_length,
+        log_std_min=args.log_std_min,
     ).to(device)
     policy.load_state_dict(policy_prior.state_dict())
 
@@ -673,6 +686,12 @@ def train(args):
 
                 # --- Shared setup for all policy loss variants ---
                 advantages = (lambda_returns - rollout["values"][:, :-1]).detach()
+                # Per-step: advantage sign balance + magnitude by horizon position
+                _adv_t = advantages.mean(dim=0)
+                _pos_t = (advantages > 0).float().mean(dim=0)
+                print(f"  [adv s={step}] mean={advantages.mean().item():+.3f} std={advantages.std().item():.3f} "
+                      f"frac+={_pos_t.mean().item():.2f} "
+                      f"early={_adv_t[:4].tolist()} late={_adv_t[-4:].tolist()}")
                 if args.time_normalize_adv:
                     # Center per-timestep across the batch: removes structural bias
                     # where early timesteps are almost always positive (value hasn't
@@ -924,6 +943,8 @@ if __name__ == "__main__":
     p.add_argument("--action_dim", type=int, default=16)
     p.add_argument("--mtp_length", type=int, default=8)
     p.add_argument("--head_mlp_ratio", type=float, default=2.0)
+    p.add_argument("--log_std_min", type=float, default=-10.0,
+                   help="Policy log-std floor (default -10 → std≥0.00005). Raise to force exploration, e.g. -1 → std≥0.37")
     # reward head config (loaded from phase2 ckpt args; override only if needed)
     p.add_argument("--rw_num_bins", type=int, default=11)
     p.add_argument("--rw_low", type=float, default=0.0)
