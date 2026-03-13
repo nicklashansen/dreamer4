@@ -864,7 +864,7 @@ def train(args):
                     }, step=step)
 
                 # --- Checkpointing ---
-                if is_rank0() and args.save_every > 0 and step > 0 and (step % args.save_every == 0) and do_step:
+                if is_rank0() and args.save_every > 0 and step > 0 and (step % args.save_every == 0):
                     save_ckpt(
                         ckpt_dir / f"step_{step:07d}.pt",
                         step=step, epoch=epoch,
