@@ -40,7 +40,7 @@ from model import (
     temporal_patchify, pack_bottleneck_to_spatial,
     denoise_one_step,
 )
-from agent import PolicyHead, RewardHead, ValueHead, compute_lambda_returns, pmpo_loss, ppo_loss, reinforce_loss, _check_head_config
+from agent import PolicyHead, RewardHead, ValueHead, ReturnEMA, compute_lambda_returns, pmpo_loss, ppo_loss, reinforce_loss, _check_head_config
 from train_dynamics import (
     get_dist_info, is_rank0, seed_everything, worker_init_fn,
     init_distributed, load_frozen_tokenizer_from_pt_ckpt,
@@ -62,6 +62,7 @@ def save_ckpt(
     epoch: int,
     policy: PolicyHead,
     value: ValueHead,
+    reward_head: RewardHead,
     opt,
     scaler,
     args: argparse.Namespace,
@@ -72,6 +73,7 @@ def save_ckpt(
         "epoch": epoch,
         "policy": policy.state_dict(),
         "value": value.state_dict(),
+        "reward": reward_head.state_dict(),
         "opt": opt.state_dict(),
         "scaler": scaler.state_dict() if scaler is not None else None,
         "args": vars(args),
@@ -533,6 +535,8 @@ def train(args):
         hidden=head_hidden,
         mtp_length=mtp_length,
         log_std_min=args.log_std_min,
+        std_parameterization=args.std_parameterization,
+        min_std=args.min_std,
     ).to(device)
     policy.load_state_dict(policy_prior.state_dict())
 
@@ -616,6 +620,19 @@ def train(args):
         if is_rank0():
             print(f"Resumed from {args.resume} (step={step}, epoch={start_epoch})")
 
+    # --- Return range EMA for Dreamer v3 style REINFORCE normalization ---
+    return_ema = ReturnEMA(decay=0.99)
+
+    # --- EMA tracker for smooth logging ---
+    ema_decay = 0.95
+    ema = {}
+    def ema_update(key, val):
+        if key not in ema:
+            ema[key] = val
+        else:
+            ema[key] = ema_decay * ema[key] + (1 - ema_decay) * val
+        return ema[key]
+
     # --- Training loop ---
     policy.train()
     value_head.train()
@@ -646,8 +663,7 @@ def train(args):
                 act_mask_shifted[:, 1:] = mask[:, :-1]
 
                 B, T = frames.shape[:2]
-
-                # here, expand over the group dimension (B, ...) --> (B G, ...) 
+                G = max(1, args.group_size)
 
                 # --- Frozen encode ---
                 with torch.no_grad():
@@ -658,6 +674,20 @@ def train(args):
                 # Agent tokens from frozen task_embedder
                 with torch.no_grad():
                     agent_tokens = task_embedder(emb_id, B=B, T=T)
+
+                # --- Group expansion: repeat each context G times for within-group comparison ---
+                if G > 1:
+                    def _repeat(x):
+                        # (B, ...) → (B*G, ...): each context appears G consecutive times
+                        return x.unsqueeze(1).expand(-1, G, *(-1,) * (x.dim() - 1)).reshape(B * G, *x.shape[1:])
+                    z1 = _repeat(z1)
+                    actions = _repeat(actions)
+                    act_mask_shifted = _repeat(act_mask_shifted)
+                    mask = _repeat(mask)
+                    agent_tokens = _repeat(agent_tokens)
+                    BG = B * G
+                else:
+                    BG = B
 
                 # --- Imagined rollout ---
                 rollout = imagine_rollout(
@@ -686,6 +716,13 @@ def train(args):
 
                 # --- Shared setup for all policy loss variants ---
                 advantages = (lambda_returns - rollout["values"][:, :-1]).detach()
+
+                # Group-normalize advantages: center within each group so signal
+                # reflects action quality, not starting-state quality.
+                if G > 1:
+                    adv_grouped = advantages.view(B, G, -1)  # (B, G, horizon)
+                    advantages = (adv_grouped - adv_grouped.mean(dim=1, keepdim=True)).view(BG, -1)
+
                 # Per-step: advantage sign balance + magnitude by horizon position
                 _adv_t = advantages.mean(dim=0)
                 _pos_t = (advantages > 0).float().mean(dim=0)
@@ -739,6 +776,7 @@ def train(args):
                         total_loss = (args.w_policy * policy_loss if policy_active else 0.0) + args.w_value * value_loss
 
                 elif args.policy_loss == "reinforce":
+                    ret_scale = return_ema.update(lambda_returns)
                     with autocast(device_type="cuda", enabled=use_amp):
                         value_loss = value_head.loss(rollout["h_states"], lambda_returns.detach())
                         policy_loss = reinforce_loss(
@@ -746,6 +784,7 @@ def train(args):
                             advantages.reshape(-1),
                             entropy_coef=args.entropy_coef,
                             action_dim=valid_dims,
+                            return_scale=ret_scale,
                         )
                         total_loss = (args.w_policy * policy_loss if policy_active else 0.0) + args.w_value * value_loss
 
@@ -805,39 +844,42 @@ def train(args):
                             opt.step()
                         opt.zero_grad(set_to_none=True)
 
+                # --- EMA update (every step) ---
+                _lp_vals = rollout["log_probs"].detach()
+                _raw_adv = (lambda_returns - rollout["values"][:, :-1]).detach()
+                ema_update("total", total_loss.item())
+                ema_update("pi", policy_loss.item())
+                ema_update("val", value_loss.item())
+                ema_update("adv+", (advantages > 0).float().mean().item())
+                ema_update("R", lambda_returns.mean().item())
+                ema_update("r", rollout["rewards"].mean().item())
+                ema_update("V", rollout["values"][:, :-1].mean().item())
+                ema_update("lp", _lp_vals.mean().item())
+                ema_update("adv_mean", _raw_adv.mean().item())
+                ema_update("adv_std", _raw_adv.std().item())
+
                 # --- Logging ---
                 if is_rank0() and (step % args.log_every == 0):
                     elapsed = (time.time() - t0) / 3600.0
-                    adv_pos_frac = (advantages > 0).float().mean().item()
-                    mean_return = lambda_returns.mean().item()
-                    mean_reward = rollout["rewards"].mean().item()
-                    mean_value = rollout["values"][:, :-1].mean().item()
-
-                    # Diagnostic stats
-                    lp_vals = rollout["log_probs"].detach()
-                    raw_adv = (lambda_returns - rollout["values"][:, :-1]).detach()
                     mu_diag, std_diag = policy(rollout["h_states"][:, :1])
                     pi_std_mean = std_diag.mean().item()
 
-                    # Per-timestep advantage breakdown — always show raw to reveal temporal bias.
-                    # If time_normalize_adv is on, also show what the policy actually sees.
-                    adv_pos_frac = (advantages > 0).float().mean().item()
-                    H_log = raw_adv.shape[1]
-                    raw_pos_by_t  = (raw_adv > 0).float().mean(dim=0)
-                    raw_mean_by_t = raw_adv.mean(dim=0)
+                    H_log = _raw_adv.shape[1]
+                    raw_pos_by_t  = (_raw_adv > 0).float().mean(dim=0)
+                    raw_mean_by_t = _raw_adv.mean(dim=0)
                     raw_pos_str  = " ".join(f"{raw_pos_by_t[t].item():.2f}"  for t in range(H_log))
                     raw_mean_str = " ".join(f"{raw_mean_by_t[t].item():+.2f}" for t in range(H_log))
                     print(
                         f"step {step:07d} | "
-                        f"total={total_loss.item():.4f} "
-                        f"pi={policy_loss.item():.4f} "
-                        f"val={value_loss.item():.4f} "
-                        f"| adv+={adv_pos_frac:.2f} "
-                        f"R={mean_return:.3f} "
-                        f"r={mean_reward:.3f} "
-                        f"V={mean_value:.3f} "
-                        f"| lp={lp_vals.mean().item():.1f}[{lp_vals.min().item():.1f},{lp_vals.max().item():.1f}] "
-                        f"adv_raw={raw_adv.mean().item():.3f}±{raw_adv.std().item():.3f} "
+                        f"total={ema['total']:.4f} "
+                        f"pi={ema['pi']:.4f} "
+                        f"val={ema['val']:.4f} "
+                        f"| adv+={ema['adv+']:.2f} "
+                        f"R={ema['R']:.3f} "
+                        f"r={ema['r']:.3f} "
+                        f"V={ema['V']:.3f} "
+                        f"| lp={ema['lp']:.1f}[{_lp_vals.min().item():.1f},{_lp_vals.max().item():.1f}] "
+                        f"adv_raw={ema['adv_mean']:.3f}±{ema['adv_std']:.3f} "
                         f"std={pi_std_mean:.4f} "
                         f"| {elapsed:.2f}h"
                     )
@@ -851,13 +893,15 @@ def train(args):
                         print(f"         adv+(nrm) by t: [{norm_pos_str}]")
                         print(f"         adv (nrm) by t: [{norm_mean_str}]")
                     wandb.log({
-                        "loss/total": total_loss.item(),
-                        "loss/policy": policy_loss.item(),
-                        "loss/value": value_loss.item(),
-                        "stats/adv_pos_frac": adv_pos_frac,
-                        "stats/mean_return": mean_return,
-                        "stats/mean_reward": mean_reward,
-                        "stats/mean_value": mean_value,
+                        "loss/total": ema["total"],
+                        "loss/policy": ema["pi"],
+                        "loss/value": ema["val"],
+                        "stats/adv_pos_frac": ema["adv+"],
+                        "stats/mean_return": ema["R"],
+                        "stats/mean_reward": ema["r"],
+                        "stats/mean_value": ema["V"],
+                        "stats/mean_lp": ema["lp"],
+                        "stats/pi_std": pi_std_mean,
                         "time/hrs": elapsed,
                     }, step=step)
 
@@ -867,12 +911,14 @@ def train(args):
                         ckpt_dir / f"step_{step:07d}.pt",
                         step=step, epoch=epoch,
                         policy=policy, value=value_head,
+                        reward_head=reward_head,
                         opt=opt, scaler=scaler, args=args,
                     )
                     save_ckpt(
                         ckpt_dir / "latest.pt",
                         step=step, epoch=epoch,
                         policy=policy, value=value_head,
+                        reward_head=reward_head,
                         opt=opt, scaler=scaler, args=args,
                     )
 
@@ -886,6 +932,7 @@ def train(args):
             ckpt_dir / "final.pt",
             step=step, epoch=start_epoch,
             policy=policy, value=value_head,
+            reward_head=reward_head,
             opt=opt, scaler=scaler, args=args,
         )
 
@@ -944,7 +991,12 @@ if __name__ == "__main__":
     p.add_argument("--mtp_length", type=int, default=8)
     p.add_argument("--head_mlp_ratio", type=float, default=2.0)
     p.add_argument("--log_std_min", type=float, default=-10.0,
-                   help="Policy log-std floor (default -10 → std≥0.00005). Raise to force exploration, e.g. -1 → std≥0.37")
+                   help="Policy log-std floor for tanh parameterization (default -10 → std≥0.00005)")
+    p.add_argument("--std_parameterization", type=str, default="tanh",
+                   choices=["tanh", "softplus"],
+                   help="Policy std parameterization: 'tanh' (TD-MPC2 bounded) or 'softplus' (Dreamer v3 unbounded)")
+    p.add_argument("--min_std", type=float, default=0.1,
+                   help="Policy std floor for softplus parameterization (Dreamer v3 default: 0.1)")
     # reward head config (loaded from phase2 ckpt args; override only if needed)
     p.add_argument("--rw_num_bins", type=int, default=11)
     p.add_argument("--rw_low", type=float, default=0.0)

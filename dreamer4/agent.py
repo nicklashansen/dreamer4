@@ -296,12 +296,16 @@ class PolicyHead(nn.Module):
         mtp_length: int = 8,
         log_std_min: float = -10.0,
         log_std_max: float = 2.0,
+        std_parameterization: str = "tanh",  # "tanh" (TD-MPC2) or "softplus" (Dreamer v3)
+        min_std: float = 0.1,  # floor for softplus parameterization
     ):
         super().__init__()
         self.action_dim = int(action_dim)
         self.mtp_length = int(mtp_length)
         self.log_std_min = float(log_std_min)
         self.log_std_max = float(log_std_max)
+        self.std_parameterization = std_parameterization
+        self.min_std = float(min_std)
 
         # One MLP outputs mean + raw_std for all L future steps
         out_dim = mtp_length * action_dim * 2  # mean and raw_std
@@ -322,11 +326,14 @@ class PolicyHead(nn.Module):
         mu = 5.0 * torch.tanh(raw[..., 0] / 5.0)  # pre-tanh mean, bounded to [-5, 5]
         std_raw = raw[..., 1]
 
-        # Bounded log_std via tanh (TD-MPC2 style)
-        # log_std ∈ [log_std_min, log_std_max] → std ∈ [exp(min), exp(max)]
-        # With defaults: std ∈ [0.0067, 7.389]
-        log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (torch.tanh(std_raw) + 1)
-        std = torch.exp(log_std)
+        if self.std_parameterization == "softplus":
+            # Dreamer v3 style: unbounded above, floored below, gradients flow freely
+            std = torch.nn.functional.softplus(std_raw) + self.min_std
+        else:
+            # TD-MPC2 style: bounded log_std via tanh
+            # log_std ∈ [log_std_min, log_std_max] → std ∈ [exp(min), exp(max)]
+            log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (torch.tanh(std_raw) + 1)
+            std = torch.exp(log_std)
 
         return mu, std
 
@@ -639,36 +646,61 @@ def ppo_loss(
     return policy_loss + entropy_loss
 
 
+class ReturnEMA:
+    """EMA of the 5th-to-95th percentile return range (Dreamer v3, Eq. 7).
+
+    Provides a robust normalization scale S that is insensitive to outliers
+    and smoothed over time.
+    """
+
+    def __init__(self, decay: float = 0.99):
+        self.decay = decay
+        self.S = 1.0  # initial scale (will be overwritten on first update)
+        self._initialized = False
+
+    def update(self, returns: torch.Tensor) -> float:
+        """Update and return the current scale S = EMA(Per95 - Per5)."""
+        r = returns.detach().float()
+        per5 = torch.quantile(r, 0.05).item()
+        per95 = torch.quantile(r, 0.95).item()
+        raw_range = per95 - per5
+        if not self._initialized:
+            self.S = raw_range
+            self._initialized = True
+        else:
+            self.S = self.decay * self.S + (1 - self.decay) * raw_range
+        return max(1.0, self.S)
+
+
 def reinforce_loss(
     log_probs: torch.Tensor,
     advantages: torch.Tensor,
     entropy_coef: float = 3e-4,
     action_dim: Union[int, torch.Tensor] = 1,
+    return_scale: float = 1.0,
 ) -> torch.Tensor:
-    """REINFORCE with advantage baseline (vanilla policy gradient).
+    """REINFORCE policy gradient (Dreamer v3 style, Eq. 6).
 
-    L = -mean(A_norm * log π / action_dim)
+    L = -mean(sg(advantages) / max(1, S) * log π / action_dim) + η * mean(lp)
 
-    Advantages are normalized to zero mean / unit std. Simpler than PMPO
-    (no sign-split) and PPO (no clipping) — useful as a baseline.
+    Advantages are normalized by a percentile-based range S (computed
+    externally via ReturnEMA) rather than z-score, making the gradient
+    robust to outlier returns.
 
     Args:
         log_probs: (N,) log π(a|s)
         advantages: (N,) A_t = R^λ_t - v_t
         entropy_coef: entropy regularization coefficient
         action_dim: scalar or (N,) per-sample valid dim count for normalization
+        return_scale: S from ReturnEMA.update() — percentile range for normalization
     """
     if isinstance(action_dim, torch.Tensor):
         lp = log_probs / action_dim.clamp(min=1).float()
     else:
         lp = log_probs / max(action_dim, 1)
 
-    adv_std = advantages.std()
-    if adv_std > 1e-8:
-        adv_norm = (advantages - advantages.mean()) / adv_std
-    else:
-        adv_norm = torch.zeros_like(advantages)
+    adv_norm = advantages.detach() / max(1.0, return_scale)
 
-    policy_loss = -(adv_norm.detach() * lp).mean()
+    policy_loss = -(adv_norm * lp).mean()
     entropy_loss = entropy_coef * lp.mean()
     return policy_loss + entropy_loss
