@@ -810,7 +810,7 @@ def train(args):
                             advantages.reshape(-1),
                             entropy_coef=args.entropy_coef,
                             action_dim=valid_dims,
-                            return_scale=ret_scale,
+                            return_scale=1.0 if advnorm else ret_scale,
                         )
                         total_loss = (args.w_policy * policy_loss if policy_active else 0.0) + args.w_value * value_loss
 
@@ -861,13 +861,15 @@ def train(args):
                     if do_step:
                         if args.grad_clip > 0:
                             scaler.unscale_(opt)
-                            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=args.grad_clip)
-                            torch.nn.utils.clip_grad_norm_(value_head.parameters(), max_norm=args.grad_clip)
-                            # Capture grad norms after clipping (avoids AMP inf)
-                            _pi_gnorm = sum(p.grad.norm().item() ** 2 for p in policy.parameters() if p.grad is not None) ** 0.5
-                            _val_gnorm = sum(p.grad.norm().item() ** 2 for p in value_head.parameters() if p.grad is not None) ** 0.5
-                            ema_update("grad_pi", _pi_gnorm)
-                            ema_update("grad_val", _val_gnorm)
+                            # Capture grad norms before clipping
+                            _pi_gnorm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=args.grad_clip).item()
+                            _val_gnorm = torch.nn.utils.clip_grad_norm_(value_head.parameters(), max_norm=args.grad_clip).item()
+                            # clip_grad_norm_ returns the total norm before clipping;
+                            # only log if finite (AMP overflow produces inf)
+                            if math.isfinite(_pi_gnorm):
+                                ema_update("grad_pi", _pi_gnorm)
+                            if math.isfinite(_val_gnorm):
+                                ema_update("grad_val", _val_gnorm)
                         if use_amp:
                             scaler.step(opt)
                             scaler.update()
