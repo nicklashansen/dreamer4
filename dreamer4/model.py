@@ -741,6 +741,7 @@ def denoise_one_step(
     actions: Optional[torch.Tensor] = None,       # (B, t+1, A)
     act_mask: Optional[torch.Tensor] = None,      # (B, t+1, A) or (A,)
     agent_tokens: Optional[torch.Tensor] = None,  # (B, t+1, n_agent, d_model)
+    ctx_renoise_idx: int = -1,                    # -1 disables; [0, k_max-1] enables context renoise
     use_amp: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Denoise one future latent given past context.
@@ -766,6 +767,21 @@ def denoise_one_step(
     step_idxs = torch.full((B, t + 1), emax, device=device, dtype=torch.long)
     step_idxs[:, -1] = e
     signal_idxs = torch.full((B, t + 1), k_max - 1, device=device, dtype=torch.long)
+    ctx_idx = int(ctx_renoise_idx)
+    if ctx_idx < -1 or ctx_idx > int(k_max) - 1:
+        raise ValueError(f"ctx_renoise_idx must be in [-1, {k_max - 1}], got {ctx_renoise_idx}")
+
+    use_ctx_renoise = ctx_idx >= 0
+    if use_ctx_renoise:
+        sigma_ctx = float(ctx_idx) / float(k_max)
+        eps_ctx = torch.randn_like(past_packed)
+        past_noised = ((1.0 - sigma_ctx) * eps_ctx + sigma_ctx * past_packed).to(dtype)
+        signal_idxs[:, :-1] = ctx_idx
+        ctx_mask = torch.zeros((B, t + 1, 1, 1), device=device, dtype=torch.bool)
+        ctx_mask[:, :t] = True
+    else:
+        past_noised = past_packed
+        ctx_mask = None
 
     if act_mask is not None and act_mask.dim() == 1:
         act_mask = act_mask.view(1, 1, -1).expand(B, t + 1, -1)
@@ -776,7 +792,12 @@ def denoise_one_step(
     h_t_full = None
     for i in range(K):
         signal_idxs[:, -1] = int(tau_idx[i])
-        packed_seq = torch.cat([past_packed, z], dim=1)
+        packed_clean = torch.cat([past_packed, z], dim=1)
+        if use_ctx_renoise:
+            packed_noised = torch.cat([past_noised, z], dim=1)
+            packed_seq = torch.where(ctx_mask, packed_noised, packed_clean)
+        else:
+            packed_seq = packed_clean
         with torch.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
             x1_hat_full, h_t_full = dyn(
                 actions_in, step_idxs, signal_idxs, packed_seq,
