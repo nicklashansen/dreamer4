@@ -274,6 +274,68 @@ class TanhNormal:
 
 
 # ---------------------------------------------------------------------------
+# BoundedNormal — Dreamer v3 style: plain Normal centered at tanh(mean)
+# ---------------------------------------------------------------------------
+
+class BoundedNormal:
+    """Normal distribution with mean squashed to [-1, 1] via tanh.
+
+    Unlike TanhNormal, there is NO Jacobian correction — actions are sampled
+    from N(tanh(mu), sigma) directly and clipped to [-1, 1].  This avoids the
+    pathological log-prob increase with growing sigma that TanhNormal suffers from.
+
+    Dreamer v3 uses this with sigma ∈ [minstd, maxstd] via sigmoid bounding.
+    """
+
+    def __init__(self, mu: torch.Tensor, sigma: torch.Tensor,
+                 mask: Optional[torch.Tensor] = None):
+        self.mu = mu            # pre-squash mean (raw network output)
+        self.sigma = sigma      # std in action space
+        self.mask = mask
+        self._mean = torch.tanh(mu)  # squashed mean in [-1, 1]
+        if mask is not None:
+            self._mean = self._mean * mask
+        self._normal = Normal(self._mean, sigma)
+
+    def rsample(self) -> torch.Tensor:
+        x = self._normal.rsample()
+        if self.mask is not None:
+            x = x * self.mask
+        return x.clamp(-1, 1)
+
+    def rsample_with_log_prob(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self._normal.rsample()
+        if self.mask is not None:
+            x = x * self.mask
+        actions = x.clamp(-1, 1)
+        # Log prob of the unclamped sample under the Normal (no Jacobian)
+        per_dim_lp = self._normal.log_prob(x)
+        if self.mask is not None:
+            per_dim_lp = per_dim_lp * self.mask
+        log_p = per_dim_lp.sum(dim=-1)
+        return actions, log_p
+
+    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+        per_dim = self._normal.log_prob(actions)
+        if self.mask is not None:
+            per_dim = per_dim * self.mask
+        return per_dim.sum(dim=-1)
+
+    def log_prob_per_dim(self, actions: torch.Tensor) -> torch.Tensor:
+        return self._normal.log_prob(actions)
+
+    def entropy(self) -> torch.Tensor:
+        ent = self._normal.entropy()
+        if self.mask is not None:
+            ent = ent * self.mask
+        return ent.sum(dim=-1)
+
+    @property
+    def mean(self) -> torch.Tensor:
+        return self._mean
+
+
+# ---------------------------------------------------------------------------
 # Policy Head — TanhNormal for continuous actions in [-1, 1]
 # ---------------------------------------------------------------------------
 
@@ -296,8 +358,10 @@ class PolicyHead(nn.Module):
         mtp_length: int = 8,
         log_std_min: float = -10.0,
         log_std_max: float = 2.0,
-        std_parameterization: str = "tanh",  # "tanh" (TD-MPC2) or "softplus" (Dreamer v3)
-        min_std: float = 0.1,  # floor for softplus parameterization
+        std_parameterization: str = "tanh",  # "tanh" (TD-MPC2), "softplus", or "sigmoid" (Dreamer v3)
+        min_std: float = 0.1,
+        max_std: float = 1.0,   # upper bound for sigmoid parameterization
+        dist_type: str = "tanh_normal",  # "tanh_normal" or "bounded_normal" (Dreamer v3)
     ):
         super().__init__()
         self.action_dim = int(action_dim)
@@ -306,6 +370,8 @@ class PolicyHead(nn.Module):
         self.log_std_max = float(log_std_max)
         self.std_parameterization = std_parameterization
         self.min_std = float(min_std)
+        self.max_std = float(max_std)
+        self.dist_type = dist_type
 
         # One MLP outputs mean + raw_std for all L future steps
         out_dim = mtp_length * action_dim * 2  # mean and raw_std
@@ -317,45 +383,45 @@ class PolicyHead(nn.Module):
             h_t: (B, T, d_model) — agent token outputs (squeezed from n_agent=1)
 
         Returns:
-            mu:  (B, T, L, action_dim) — pre-tanh mean
-            std: (B, T, L, action_dim) — std in pre-tanh space
+            mu:  (B, T, L, action_dim) — raw mean (interpretation depends on dist_type)
+            std: (B, T, L, action_dim) — std
         """
         B, T, D = h_t.shape
         raw = self.mlp(h_t)  # (B, T, L*A*2)
         raw = raw.view(B, T, self.mtp_length, self.action_dim, 2)
-        mu = 5.0 * torch.tanh(raw[..., 0] / 5.0)  # pre-tanh mean, bounded to [-5, 5]
+        mu = 5.0 * torch.tanh(raw[..., 0] / 5.0)  # bounded to [-5, 5]
         std_raw = raw[..., 1]
 
-        if self.std_parameterization == "softplus":
-            # Dreamer v3 style: unbounded above, floored below, gradients flow freely
+        if self.std_parameterization == "sigmoid":
+            # Dreamer v3 style: std ∈ [min_std, max_std] via sigmoid
+            std = (self.max_std - self.min_std) * torch.sigmoid(std_raw + 2.0) + self.min_std
+        elif self.std_parameterization == "softplus":
             std = torch.nn.functional.softplus(std_raw) + self.min_std
         else:
             # TD-MPC2 style: bounded log_std via tanh
-            # log_std ∈ [log_std_min, log_std_max] → std ∈ [exp(min), exp(max)]
             log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (torch.tanh(std_raw) + 1)
             std = torch.exp(log_std)
 
         return mu, std
 
     def dist(self, h_t: torch.Tensor, step: Optional[int] = None,
-             mask: Optional[torch.Tensor] = None) -> TanhNormal:
-        """Get TanhNormal action distribution.
+             mask: Optional[torch.Tensor] = None):
+        """Get action distribution.
 
         Args:
             h_t:  (B, T, d_model)
             step: if given, return dist for that MTP step only (batch shape (B, T));
                   if None, return dist for all L steps (batch shape (B, T, L))
             mask: (..., action_dim) broadcastable validity mask (1=valid, 0=padding).
-                  Typically (B, 1, action_dim) so it broadcasts over T/L dimensions.
-                  If None, all dims are treated as valid.
 
         Returns:
-            TanhNormal distribution with event shape (action_dim,)
+            TanhNormal or BoundedNormal distribution
         """
         mu, std = self.forward(h_t)  # (B, T, L, A)
+        DistCls = BoundedNormal if self.dist_type == "bounded_normal" else TanhNormal
         if step is not None:
-            return TanhNormal(mu[:, :, step], std[:, :, step], mask=mask)
-        return TanhNormal(mu, std, mask=mask)
+            return DistCls(mu[:, :, step], std[:, :, step], mask=mask)
+        return DistCls(mu, std, mask=mask)
 
     def sample(self, h_t: torch.Tensor, step: Optional[int] = None,
                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -487,6 +553,80 @@ class ValueHead(nn.Module):
         """
         dist = self.dist(h_t)
         return -dist.log_prob(targets).mean()
+
+
+# ---------------------------------------------------------------------------
+# Running normalizer (Dreamer v3 style)
+# ---------------------------------------------------------------------------
+
+class RunningNorm:
+    """Running mean/std normalization with EMA, matching Dreamer v3's Normalize.
+
+    Tracks offset (mean) and scale (std) of a stream of values, used
+    for normalizing value targets (valnorm) and advantages (advnorm).
+    Returns (offset, scale) and optionally normalizes in place.
+    """
+
+    def __init__(self, decay: float = 0.99, max_scale: float = 1e8,
+                 min_scale: float = 1e-8):
+        self.decay = decay
+        self.max_scale = max_scale
+        self.min_scale = min_scale
+        self._mean = 0.0
+        self._var = 1.0
+        self._initialized = False
+
+    def __call__(self, x: torch.Tensor, update: bool = True):
+        """Return (offset, scale) and optionally update stats."""
+        if update:
+            batch_mean = x.detach().float().mean().item()
+            batch_var = x.detach().float().var().item()
+            if not self._initialized:
+                self._mean = batch_mean
+                self._var = batch_var
+                self._initialized = True
+            else:
+                self._mean = self.decay * self._mean + (1 - self.decay) * batch_mean
+                self._var = self.decay * self._var + (1 - self.decay) * batch_var
+        scale = max(self.min_scale, min(self.max_scale, self._var ** 0.5))
+        return self._mean, scale
+
+    def stats(self):
+        scale = max(self.min_scale, min(self.max_scale, self._var ** 0.5))
+        return self._mean, scale
+
+
+# ---------------------------------------------------------------------------
+# Slow (EMA) value head for target stabilization (Dreamer v3)
+# ---------------------------------------------------------------------------
+
+class SlowValueHead:
+    """Exponential moving average copy of a ValueHead for stable TD targets.
+
+    The slow copy's parameters track the main value head with a given decay.
+    Dreamer v3 also uses it as a regularization target: the value head is
+    trained to match the slow copy in addition to the TD(λ) targets.
+    """
+
+    def __init__(self, value_head: ValueHead, decay: float = 0.98):
+        self.decay = decay
+        # Deep copy the value head
+        import copy
+        self.slow = copy.deepcopy(value_head)
+        for p in self.slow.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, value_head: ValueHead):
+        """EMA update: slow ← decay * slow + (1 - decay) * current."""
+        for sp, fp in zip(self.slow.parameters(), value_head.parameters()):
+            sp.data.mul_(self.decay).add_(fp.data, alpha=1 - self.decay)
+
+    def predict(self, h_t: torch.Tensor) -> torch.Tensor:
+        return self.slow.predict(h_t)
+
+    def dist(self, h_t: torch.Tensor) -> TwoHotDist:
+        return self.slow.dist(h_t)
 
 
 # ---------------------------------------------------------------------------

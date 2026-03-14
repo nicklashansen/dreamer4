@@ -40,7 +40,7 @@ from model import (
     temporal_patchify, pack_bottleneck_to_spatial,
     denoise_one_step,
 )
-from agent import PolicyHead, RewardHead, ValueHead, ReturnEMA, compute_lambda_returns, pmpo_loss, ppo_loss, reinforce_loss, _check_head_config
+from agent import PolicyHead, RewardHead, ValueHead, SlowValueHead, RunningNorm, ReturnEMA, TwoHotDist, compute_lambda_returns, pmpo_loss, ppo_loss, reinforce_loss, _check_head_config
 from train_dynamics import (
     get_dist_info, is_rank0, seed_everything, worker_init_fn,
     init_distributed, load_frozen_tokenizer_from_pt_ckpt,
@@ -392,25 +392,16 @@ def imagine_rollout(
         v_boot = value_head.predict(h_prev.unsqueeze(1))[:, 0]
     values_list.append(v_boot)
     
+    # h_states_full includes the bootstrap state for slow critic
+    h_states_full = h_states + [h_prev.detach()]  # H+1 states
     ret_values = {
-        "h_states": torch.stack(h_states, dim=1),    # (B, H, d_model)
-        "actions": torch.stack(actions_list, dim=1),  # (B, H, action_dim)
+        "h_states": torch.stack(h_states, dim=1),         # (B, H, d_model)
+        "h_states_full": torch.stack(h_states_full, dim=1),  # (B, H+1, d_model)
+        "actions": torch.stack(actions_list, dim=1),       # (B, H, action_dim)
         "log_probs": torch.stack(log_probs_list, dim=1),  # (B, H)
-        "rewards": torch.stack(rewards_list, dim=1),  # (B, H)
-        "values": torch.stack(values_list, dim=1),    # (B, H+1)
+        "rewards": torch.stack(rewards_list, dim=1),       # (B, H)
+        "values": torch.stack(values_list, dim=1),         # (B, H+1)
     }
-    # Compact rollout diagnostics — detect action saturation, reward/value issues
-    _a = ret_values["actions"]
-    _lp = ret_values["log_probs"]
-    _r = ret_values["rewards"]
-    _v = ret_values["values"][:, :-1]
-    _sat = (_a.abs() > 0.99).float().mean().item()
-    print(f"  [rollout] act_sat={_sat:.2f} act_std={_a.std(0).mean().item():.3f} "
-          f"lp={_lp.mean().item():.1f}±{_lp.std().item():.1f} "
-          f"r={_r.mean().item():.3f}[{_r.min().item():.2f},{_r.max().item():.2f}] "
-          f"v={_v.mean().item():.3f}[{_v.min().item():.2f},{_v.max().item():.2f}] "
-          f"r-v={(_r - _v).mean().item():+.3f}")
-
     return ret_values
 
 
@@ -537,6 +528,8 @@ def train(args):
         log_std_min=args.log_std_min,
         std_parameterization=args.std_parameterization,
         min_std=args.min_std,
+        max_std=args.max_std,
+        dist_type=args.dist_type,
     ).to(device)
     policy.load_state_dict(policy_prior.state_dict())
 
@@ -623,6 +616,15 @@ def train(args):
     # --- Return range EMA for Dreamer v3 style REINFORCE normalization ---
     return_ema = ReturnEMA(decay=0.99)
 
+    # --- Slow critic (Dreamer v3) ---
+    slow_value = None
+    if args.slow_critic:
+        slow_value = SlowValueHead(value_head, decay=args.slow_critic_decay)
+
+    # --- Value / advantage normalizers (Dreamer v3) ---
+    valnorm = RunningNorm(decay=0.99) if args.valnorm else None
+    advnorm = RunningNorm(decay=0.99, max_scale=1e8) if args.advnorm else None
+
     # --- EMA tracker for smooth logging ---
     ema_decay = 0.95
     ema = {}
@@ -707,15 +709,31 @@ def train(args):
 
                 # --- Compute TD(λ) returns ---
                 with torch.no_grad():
-                    lambda_returns = compute_lambda_returns(
-                        rollout["rewards"],
-                        rollout["values"],
-                        gamma=args.gamma,
-                        lam=args.lam,
-                    )  # (B, horizon)
+                    # Use slow critic for bootstrap if available (Dreamer v3)
+                    if slow_value is not None:
+                        slow_vals = slow_value.predict(rollout["h_states_full"])  # (B, H+1)
+                        lambda_returns = compute_lambda_returns(
+                            rollout["rewards"],
+                            slow_vals,
+                            gamma=args.gamma,
+                            lam=args.lam,
+                        )
+                    else:
+                        lambda_returns = compute_lambda_returns(
+                            rollout["rewards"],
+                            rollout["values"],
+                            gamma=args.gamma,
+                            lam=args.lam,
+                        )  # (B, horizon)
 
                 # --- Shared setup for all policy loss variants ---
-                advantages = (lambda_returns - rollout["values"][:, :-1]).detach()
+                with torch.no_grad():
+                    tar_vals = slow_value.predict(rollout["h_states_full"])[:, :-1] if slow_value else rollout["values"][:, :-1]
+                    advantages = (lambda_returns - tar_vals).detach()
+                    # Advantage normalization (Dreamer v3 advnorm)
+                    if advnorm is not None:
+                        adv_offset, adv_scale = advnorm(advantages, update=True)
+                        advantages = (advantages - adv_offset) / adv_scale
 
                 # Group-normalize advantages: center within each group so signal
                 # reflects action quality, not starting-state quality.
@@ -723,12 +741,6 @@ def train(args):
                     adv_grouped = advantages.view(B, G, -1)  # (B, G, horizon)
                     advantages = (adv_grouped - adv_grouped.mean(dim=1, keepdim=True)).view(BG, -1)
 
-                # Per-step: advantage sign balance + magnitude by horizon position
-                _adv_t = advantages.mean(dim=0)
-                _pos_t = (advantages > 0).float().mean(dim=0)
-                print(f"  [adv s={step}] mean={advantages.mean().item():+.3f} std={advantages.std().item():.3f} "
-                      f"frac+={_pos_t.mean().item():.2f} "
-                      f"early={_adv_t[:4].tolist()} late={_adv_t[-4:].tolist()}")
                 if args.time_normalize_adv:
                     # Center per-timestep across the batch: removes structural bias
                     # where early timesteps are almost always positive (value hasn't
@@ -778,7 +790,21 @@ def train(args):
                 elif args.policy_loss == "reinforce":
                     ret_scale = return_ema.update(lambda_returns)
                     with autocast(device_type="cuda", enabled=use_amp):
-                        value_loss = value_head.loss(rollout["h_states"], lambda_returns.detach())
+                        # Value loss with optional normalization and slow critic reg
+                        val_targets = lambda_returns.detach()
+                        if valnorm is not None:
+                            voffset, vscale = valnorm(val_targets, update=True)
+                            val_targets_normed = (val_targets - voffset) / vscale
+                        else:
+                            val_targets_normed = val_targets
+                        value_loss = value_head.loss(rollout["h_states"], val_targets_normed if valnorm else val_targets)
+                        # Slow critic regularization: also train value head toward slow copy
+                        if slow_value is not None and args.slow_critic_reg > 0:
+                            with torch.no_grad():
+                                slow_logits = slow_value.slow.forward(rollout["h_states"])
+                            slow_targets = TwoHotDist(slow_logits, low=value_head.low, high=value_head.high).mean
+                            value_loss = value_loss + args.slow_critic_reg * value_head.loss(rollout["h_states"], slow_targets.detach())
+
                         policy_loss = reinforce_loss(
                             rollout["log_probs"].reshape(-1),
                             advantages.reshape(-1),
@@ -837,6 +863,11 @@ def train(args):
                             scaler.unscale_(opt)
                             torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=args.grad_clip)
                             torch.nn.utils.clip_grad_norm_(value_head.parameters(), max_norm=args.grad_clip)
+                            # Capture grad norms after clipping (avoids AMP inf)
+                            _pi_gnorm = sum(p.grad.norm().item() ** 2 for p in policy.parameters() if p.grad is not None) ** 0.5
+                            _val_gnorm = sum(p.grad.norm().item() ** 2 for p in value_head.parameters() if p.grad is not None) ** 0.5
+                            ema_update("grad_pi", _pi_gnorm)
+                            ema_update("grad_val", _val_gnorm)
                         if use_amp:
                             scaler.step(opt)
                             scaler.update()
@@ -844,19 +875,47 @@ def train(args):
                             opt.step()
                         opt.zero_grad(set_to_none=True)
 
+                # --- Slow critic EMA update ---
+                if slow_value is not None:
+                    slow_value.update(value_head)
+
                 # --- EMA update (every step) ---
                 _lp_vals = rollout["log_probs"].detach()
-                _raw_adv = (lambda_returns - rollout["values"][:, :-1]).detach()
+                _actions = rollout["actions"].detach()
                 ema_update("total", total_loss.item())
                 ema_update("pi", policy_loss.item())
                 ema_update("val", value_loss.item())
                 ema_update("adv+", (advantages > 0).float().mean().item())
+                ema_update("adv_mean", advantages.mean().item())
+                ema_update("adv_std", advantages.std().item())
                 ema_update("R", lambda_returns.mean().item())
                 ema_update("r", rollout["rewards"].mean().item())
-                ema_update("V", rollout["values"][:, :-1].mean().item())
+                # Denormalize V if valnorm is active
+                _v_raw = rollout["values"][:, :-1].mean().item()
+                if valnorm is not None:
+                    _voff, _vscl = valnorm.stats()
+                    ema_update("V", _v_raw * _vscl + _voff)
+                else:
+                    ema_update("V", _v_raw)
                 ema_update("lp", _lp_vals.mean().item())
-                ema_update("adv_mean", _raw_adv.mean().item())
-                ema_update("adv_std", _raw_adv.std().item())
+                ema_update("act_sat", (_actions.abs() > 0.99).float().mean().item())
+                ema_update("act_std", _actions.std(0).mean().item())
+                # New Dreamer v3 diagnostics
+                if slow_value is not None:
+                    with torch.no_grad():
+                        _sv = slow_value.predict(rollout["h_states_full"])[:, :-1].mean().item()
+                    if valnorm is not None:
+                        _sv = _sv * _vscl + _voff
+                    ema_update("V_slow", _sv)
+                if hasattr(return_ema, 'S'):
+                    ema_update("ret_scale", return_ema.S)
+                if valnorm is not None:
+                    _, vs = valnorm.stats()
+                    ema_update("valnorm_scale", vs)
+                if advnorm is not None:
+                    ao, ascl = advnorm.stats()
+                    ema_update("advnorm_offset", ao)
+                    ema_update("advnorm_scale", ascl)
 
                 # --- Logging ---
                 if is_rank0() and (step % args.log_every == 0):
@@ -864,44 +923,77 @@ def train(args):
                     mu_diag, std_diag = policy(rollout["h_states"][:, :1])
                     pi_std_mean = std_diag.mean().item()
 
-                    H_log = _raw_adv.shape[1]
-                    raw_pos_by_t  = (_raw_adv > 0).float().mean(dim=0)
-                    raw_mean_by_t = _raw_adv.mean(dim=0)
-                    raw_pos_str  = " ".join(f"{raw_pos_by_t[t].item():.2f}"  for t in range(H_log))
-                    raw_mean_str = " ".join(f"{raw_mean_by_t[t].item():+.2f}" for t in range(H_log))
+                    pi_grad = ema.get("grad_pi", 0.0)
+                    val_grad = ema.get("grad_val", 0.0)
+
+                    # Policy entropy (BoundedNormal has .entropy(), TanhNormal doesn't)
+                    try:
+                        _ent = policy.dist(rollout["h_states"][:, :1], step=0, mask=act_mask_1d).entropy().mean().item()
+                    except (AttributeError, NotImplementedError):
+                        _ent = -_lp_vals.mean().item()  # fallback: -mean(lp) ≈ entropy
+
+                    # Line 1: losses
                     print(
                         f"step {step:07d} | "
                         f"total={ema['total']:.4f} "
                         f"pi={ema['pi']:.4f} "
                         f"val={ema['val']:.4f} "
-                        f"| adv+={ema['adv+']:.2f} "
-                        f"R={ema['R']:.3f} "
-                        f"r={ema['r']:.3f} "
-                        f"V={ema['V']:.3f} "
-                        f"| lp={ema['lp']:.1f}[{_lp_vals.min().item():.1f},{_lp_vals.max().item():.1f}] "
-                        f"adv_raw={ema['adv_mean']:.3f}±{ema['adv_std']:.3f} "
-                        f"std={pi_std_mean:.4f} "
                         f"| {elapsed:.2f}h"
                     )
-                    print(f"         adv+(raw) by t: [{raw_pos_str}]")
-                    print(f"         adv (raw) by t: [{raw_mean_str}]")
-                    if args.time_normalize_adv:
-                        norm_pos_by_t  = (advantages > 0).float().mean(dim=0)
-                        norm_mean_by_t = advantages.mean(dim=0)
-                        norm_pos_str  = " ".join(f"{norm_pos_by_t[t].item():.2f}"  for t in range(H_log))
-                        norm_mean_str = " ".join(f"{norm_mean_by_t[t].item():+.2f}" for t in range(H_log))
-                        print(f"         adv+(nrm) by t: [{norm_pos_str}]")
-                        print(f"         adv (nrm) by t: [{norm_mean_str}]")
+                    # Line 2: reward/value/return
+                    v_slow_str = f" V_slow={ema.get('V_slow', 0):.3f}" if slow_value else ""
+                    print(
+                        f"         r={ema['r']:.3f} "
+                        f"R={ema['R']:.3f} "
+                        f"V={ema['V']:.3f}"
+                        f"{v_slow_str}"
+                    )
+                    # Line 3: policy diagnostics
+                    print(
+                        f"         std={pi_std_mean:.4f} "
+                        f"ent={_ent:.3f} "
+                        f"lp={ema['lp']:.2f}[{_lp_vals.min().item():.1f},{_lp_vals.max().item():.1f}] "
+                        f"act_sat={ema['act_sat']:.3f} "
+                        f"act_std={ema['act_std']:.4f}"
+                    )
+                    # Line 4: advantage diagnostics
+                    norm_str = ""
+                    if advnorm:
+                        norm_str = f" advnorm={ema.get('advnorm_scale', 0):.3f}"
+                    if valnorm:
+                        norm_str += f" valnorm={ema.get('valnorm_scale', 0):.3f}"
+                    ret_s = f" ret_S={ema.get('ret_scale', 1):.3f}" if args.policy_loss == "reinforce" else ""
+                    print(
+                        f"         adv={ema['adv_mean']:+.3f}±{ema['adv_std']:.3f} "
+                        f"adv+={ema['adv+']:.2f}"
+                        f"{ret_s}{norm_str}"
+                    )
+                    # Line 5: gradient norms
+                    print(
+                        f"         grad_pi={pi_grad:.3f} grad_val={val_grad:.3f}"
+                    )
+
                     wandb.log({
                         "loss/total": ema["total"],
                         "loss/policy": ema["pi"],
                         "loss/value": ema["val"],
                         "stats/adv_pos_frac": ema["adv+"],
+                        "stats/adv_mean": ema["adv_mean"],
+                        "stats/adv_std": ema["adv_std"],
                         "stats/mean_return": ema["R"],
                         "stats/mean_reward": ema["r"],
                         "stats/mean_value": ema["V"],
                         "stats/mean_lp": ema["lp"],
                         "stats/pi_std": pi_std_mean,
+                        "stats/pi_entropy": _ent,
+                        "stats/act_sat": ema["act_sat"],
+                        "stats/act_std": ema["act_std"],
+                        "stats/grad_pi": pi_grad,
+                        "stats/grad_val": val_grad,
+                        **({"stats/V_slow": ema["V_slow"]} if slow_value else {}),
+                        **({"stats/ret_scale": ema.get("ret_scale", 1)} if args.policy_loss == "reinforce" else {}),
+                        **({"stats/valnorm_scale": ema["valnorm_scale"]} if valnorm else {}),
+                        **({"stats/advnorm_scale": ema["advnorm_scale"]} if advnorm else {}),
                         "time/hrs": elapsed,
                     }, step=step)
 
@@ -993,10 +1085,27 @@ if __name__ == "__main__":
     p.add_argument("--log_std_min", type=float, default=-10.0,
                    help="Policy log-std floor for tanh parameterization (default -10 → std≥0.00005)")
     p.add_argument("--std_parameterization", type=str, default="tanh",
-                   choices=["tanh", "softplus"],
-                   help="Policy std parameterization: 'tanh' (TD-MPC2 bounded) or 'softplus' (Dreamer v3 unbounded)")
+                   choices=["tanh", "softplus", "sigmoid"],
+                   help="Policy std parameterization: 'tanh' (TD-MPC2), 'softplus', or 'sigmoid' (Dreamer v3)")
     p.add_argument("--min_std", type=float, default=0.1,
-                   help="Policy std floor for softplus parameterization (Dreamer v3 default: 0.1)")
+                   help="Policy std floor (softplus/sigmoid)")
+    p.add_argument("--max_std", type=float, default=1.0,
+                   help="Policy std ceiling for sigmoid parameterization (Dreamer v3 default: 1.0)")
+    p.add_argument("--dist_type", type=str, default="tanh_normal",
+                   choices=["tanh_normal", "bounded_normal"],
+                   help="Policy distribution: 'tanh_normal' (SAC/TD-MPC2) or 'bounded_normal' (Dreamer v3)")
+    # slow critic
+    p.add_argument("--slow_critic", action="store_true",
+                   help="Use slow (EMA) value head for stable TD targets (Dreamer v3)")
+    p.add_argument("--slow_critic_decay", type=float, default=0.98,
+                   help="EMA decay for slow critic")
+    p.add_argument("--slow_critic_reg", type=float, default=1.0,
+                   help="Regularization weight: train value head to match slow copy")
+    # normalizers
+    p.add_argument("--valnorm", action="store_true",
+                   help="Normalize value targets by running mean/scale (Dreamer v3)")
+    p.add_argument("--advnorm", action="store_true",
+                   help="Normalize advantages by running mean/scale (Dreamer v3)")
     # reward head config (loaded from phase2 ckpt args; override only if needed)
     p.add_argument("--rw_num_bins", type=int, default=11)
     p.add_argument("--rw_low", type=float, default=0.0)
