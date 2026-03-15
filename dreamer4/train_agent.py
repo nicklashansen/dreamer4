@@ -23,7 +23,7 @@ import math
 import random
 import argparse
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import wandb
 
@@ -349,6 +349,71 @@ def reward_loss(
         "reward_target_mean": rewards.mean().detach(),
     }
     return loss, aux
+
+
+# ---------------------------------------------------------------------------
+# Autoregressive rollout loss — supervised multi-step finetuning
+# ---------------------------------------------------------------------------
+
+def autoregressive_rollout_loss(
+    dyn,
+    *,
+    z1: torch.Tensor,              # (B, T, n_spatial, d_spatial) — ground truth latents
+    actions: torch.Tensor,         # (B, T, 16) — shifted actions
+    act_mask: torch.Tensor,        # (B, T, 16)
+    agent_tokens: torch.Tensor,    # (B, T, n_agent, d_model)
+    k_max: int,
+    sched: dict,
+    context_len: int,              # C: real context frames
+    rollout_len: int,              # K: autoregressive steps to predict
+    use_amp: bool = True,
+) -> Tuple[torch.Tensor, dict]:
+    """Supervised autoregressive rollout loss.
+
+    Unrolls K steps from real context, comparing each generated latent
+    against the ground-truth latent from the tokenizer. Gradients flow
+    through the full chain so the model learns from its own errors.
+    """
+    from model import denoise_one_step
+
+    B, T = z1.shape[:2]
+    K = min(rollout_len, T - context_len)
+    if K <= 0:
+        return torch.tensor(0.0, device=z1.device), {"ar_mse": torch.tensor(0.0)}
+
+    z_hist = z1[:, :context_len].detach()  # start from real context
+    losses = []
+
+    for step in range(K):
+        target_t = context_len + step
+
+        # Actions/masks/agent_tokens up to target_t+1 (for dynamics input)
+        a_hist = actions[:, :target_t + 1]
+        am_hist = act_mask[:, :target_t + 1]
+        ag_hist = agent_tokens[:, :target_t + 1]
+
+        z_pred, _ = denoise_one_step(
+            dyn,
+            past_packed=z_hist,
+            k_max=k_max,
+            sched=sched,
+            actions=a_hist,
+            act_mask=am_hist,
+            agent_tokens=ag_hist,
+            use_amp=use_amp,
+            differentiable=True,
+        )
+
+        # MSE against ground truth
+        z_target = z1[:, target_t].detach()
+        step_loss = (z_pred - z_target).pow(2).mean()
+        losses.append(step_loss)
+
+        # Append prediction to history (with gradients for backprop chain)
+        z_hist = torch.cat([z_hist, z_pred.unsqueeze(1)], dim=1)
+
+    loss = torch.stack(losses).mean()
+    return loss, {"ar_mse": loss.detach()}
 
 
 # ---------------------------------------------------------------------------
@@ -793,6 +858,12 @@ def train(args):
     k_max = dyn_info["k_max"]
     n_agent = dyn_info["n_agent"]
 
+    # AR rollout schedule (if enabled)
+    if args.w_ar_rollout > 0:
+        sched = make_tau_schedule(k_max=k_max, schedule="shortcut", d=0.25)
+    else:
+        sched = None
+
     # Build heads for BC & R
     task_embedder = TaskEmbedder(
         d_model=d_model,
@@ -1011,11 +1082,30 @@ def train(args):
                     # 4) Reward loss
                     rw_l, rw_aux = reward_loss(reward_head, h_pooled, rew)
 
+                    # 5) Autoregressive rollout loss (optional)
+                    if args.w_ar_rollout > 0:
+                        ar_l, ar_aux = autoregressive_rollout_loss(
+                            dyn,
+                            z1=z1,
+                            actions=actions,
+                            act_mask=act_mask_shifted,
+                            agent_tokens=agent_tokens,
+                            k_max=k_max,
+                            sched=sched,
+                            context_len=args.ar_context_len,
+                            rollout_len=args.ar_rollout_len,
+                            use_amp=use_amp,
+                        )
+                    else:
+                        ar_l = torch.tensor(0.0, device=device)
+
                     # RMS-normalize each loss (Dreamer v4 paper) + loss clipping
                     with torch.no_grad():
                         rms_ema["dyn"] = args.rms_decay * rms_ema["dyn"] + (1 - args.rms_decay) * abs(dyn_loss.item())
                         rms_ema["bc"] = args.rms_decay * rms_ema["bc"] + (1 - args.rms_decay) * abs(bc_l.item())
                         rms_ema["rew"] = args.rms_decay * rms_ema["rew"] + (1 - args.rms_decay) * abs(rw_l.item())
+                        if args.w_ar_rollout > 0:
+                            rms_ema["ar"] = args.rms_decay * rms_ema.get("ar", abs(ar_l.item())) + (1 - args.rms_decay) * abs(ar_l.item())
 
                     # Clip each loss to clip_mult x its running average (clip_mult=0 disables clipping)
                     def _maybe_clip(loss, ema_val):
@@ -1028,6 +1118,8 @@ def train(args):
                         + args.w_bc * _maybe_clip(bc_l, rms_ema["bc"]) / max(1.0, rms_ema["bc"])
                         + args.w_reward * _maybe_clip(rw_l, rms_ema["rew"]) / max(1.0, rms_ema["rew"])
                     )
+                    if args.w_ar_rollout > 0:
+                        total_loss = total_loss + args.w_ar_rollout * _maybe_clip(ar_l, rms_ema["ar"]) / max(1.0, rms_ema["ar"])
 
                 if not torch.isfinite(total_loss):
                     raise RuntimeError(f"Non-finite loss at step {step}: total={total_loss.item()}")
@@ -1063,6 +1155,7 @@ def train(args):
                         f"dyn={dyn_loss.item():.4f} "
                         f"bc={bc_l.item():.4f}(exp={bc_aux['bc_expert_frac'].item():.2f}) "
                         f"rew={rw_l.item():.4f} "
+                        f"{'ar=' + f'{ar_l.item():.4f} ' if args.w_ar_rollout > 0 else ''}"
                         f"| flow={dyn_aux['flow_mse'].item():.5f} "
                         f"boot={dyn_aux['bootstrap_mse'].item():.5f} "
                         f"| std={bc_aux['bc_mean_std'].item():.3f} "
@@ -1075,6 +1168,7 @@ def train(args):
                         "loss/dynamics": dyn_loss.item(),
                         "loss/bc": bc_l.item(),
                         "loss/reward": rw_l.item(),
+                        **({"loss/ar_rollout": ar_l.item()} if args.w_ar_rollout > 0 else {}),
                         "loss/flow_mse": dyn_aux["flow_mse"].item(),
                         "loss/bootstrap_mse": dyn_aux["bootstrap_mse"].item(),
                         "stats/bc_mean_std": bc_aux["bc_mean_std"].item(),
@@ -1261,6 +1355,12 @@ if __name__ == "__main__":
     p.add_argument("--w_dynamics", type=float, default=1.0)
     p.add_argument("--w_bc", type=float, default=1.0)
     p.add_argument("--w_reward", type=float, default=1.0)
+    p.add_argument("--w_ar_rollout", type=float, default=0.0,
+                   help="Weight for autoregressive rollout loss. 0 to disable.")
+    p.add_argument("--ar_context_len", type=int, default=8,
+                   help="Number of real context frames for AR rollout.")
+    p.add_argument("--ar_rollout_len", type=int, default=4,
+                   help="Number of autoregressive prediction steps.")
 
     # data filter
     p.add_argument("--mask_expert_diffusion_loss", action="store_true") # specified as true in github/pretrained

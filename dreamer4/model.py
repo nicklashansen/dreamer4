@@ -1,5 +1,6 @@
 # model.py
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Optional, Tuple, Dict
@@ -731,7 +732,6 @@ def lpips_on_mae_recon(
     return lp.mean()
 
 
-@torch.no_grad()
 def denoise_one_step(
     dyn: "Dynamics",
     *,
@@ -743,13 +743,31 @@ def denoise_one_step(
     agent_tokens: Optional[torch.Tensor] = None,  # (B, t+1, n_agent, d_model)
     ctx_renoise_idx: int = -1,                    # -1 disables; [0, k_max-1] enables context renoise
     use_amp: bool = True,
+    differentiable: bool = False,                 # if True, keep gradients for AR rollout training
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Denoise one future latent given past context.
+
+    Args:
+        differentiable: if False (default), runs under torch.no_grad() for inference.
+            Set True for autoregressive rollout training where gradients must flow.
 
     Returns:
         z: (B, n_spatial, d_spatial) — denoised next latent
         h_t: (B, n_agent, d_model) or None — agent hidden from last denoising step
     """
+    ctx = torch.no_grad() if not differentiable else nullcontext()
+    with ctx:
+        return _denoise_one_step_impl(
+            dyn, past_packed=past_packed, k_max=k_max, sched=sched,
+            actions=actions, act_mask=act_mask, agent_tokens=agent_tokens,
+            ctx_renoise_idx=ctx_renoise_idx, use_amp=use_amp,
+        )
+
+
+def _denoise_one_step_impl(
+    dyn, *, past_packed, k_max, sched, actions, act_mask, agent_tokens,
+    ctx_renoise_idx, use_amp,
+):
     device = past_packed.device
     dtype = past_packed.dtype
     B, t = past_packed.shape[:2]
@@ -791,7 +809,8 @@ def denoise_one_step(
 
     h_t_full = None
     for i in range(K):
-        signal_idxs[:, -1] = int(tau_idx[i])
+        si = signal_idxs.clone()
+        si[:, -1] = int(tau_idx[i])
         packed_clean = torch.cat([past_packed, z], dim=1)
         if use_ctx_renoise:
             packed_noised = torch.cat([past_noised, z], dim=1)
@@ -800,7 +819,7 @@ def denoise_one_step(
             packed_seq = packed_clean
         with torch.autocast(device_type=device.type, enabled=(use_amp and device.type == "cuda")):
             x1_hat_full, h_t_full = dyn(
-                actions_in, step_idxs, signal_idxs, packed_seq,
+                actions_in, step_idxs, si, packed_seq,
                 act_mask=actmask_in, agent_tokens=agent_tokens,
             )
         x1_hat = x1_hat_full[:, -1:, :, :]
