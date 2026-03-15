@@ -730,7 +730,10 @@ def train(args):
                 with torch.no_grad():
                     tar_vals = slow_value.predict(rollout["h_states_full"])[:, :-1] if slow_value else rollout["values"][:, :-1]
                     advantages = (lambda_returns - tar_vals).detach()
-                    # Advantage normalization (Dreamer v3 advnorm)
+                    # Always mean-center advantages to prevent REINFORCE from
+                    # degenerating to "push all log probs up" when V underestimates.
+                    advantages = advantages - advantages.mean()
+                    # Optional: full advantage normalization (Dreamer v3 advnorm)
                     if advnorm is not None:
                         adv_offset, adv_scale = advnorm(advantages, update=True)
                         advantages = (advantages - adv_offset) / adv_scale
@@ -810,7 +813,7 @@ def train(args):
                             advantages.reshape(-1),
                             entropy_coef=args.entropy_coef,
                             action_dim=valid_dims,
-                            return_scale=1.0 if advnorm else ret_scale,
+                            return_scale=1.0,
                         )
                         total_loss = (args.w_policy * policy_loss if policy_active else 0.0) + args.w_value * value_loss
 
