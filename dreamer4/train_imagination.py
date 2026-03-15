@@ -279,6 +279,7 @@ def imagine_rollout(
     k_max: int,
     sched: dict,
     action_dim: int,
+    denorm_value=None,               # callable: v_raw -> v_denormalized (for valnorm)
     ctx_renoise_idx: int = -1,
     use_amp: bool = True,
 ) -> Dict[str, torch.Tensor]:
@@ -341,6 +342,8 @@ def imagine_rollout(
         # the current state to align TD(lambda) targets with values at h_s.
         with autocast(device_type="cuda", enabled=use_amp):
             v = value_head.predict(h_prev.unsqueeze(1))[:, 0]  # (B,)
+            if denorm_value is not None:
+                v = denorm_value(v)
             r = reward_head.predict(h_prev.unsqueeze(1), step=0)[:, 0]  # (B,)
         values_list.append(v)
         rewards_list.append(r.detach())
@@ -390,6 +393,8 @@ def imagine_rollout(
     # Bootstrap value: h_prev is already h_H from the last denoising step.
     with autocast(device_type="cuda", enabled=use_amp):
         v_boot = value_head.predict(h_prev.unsqueeze(1))[:, 0]
+        if denorm_value is not None:
+            v_boot = denorm_value(v_boot)
     values_list.append(v_boot)
     
     # h_states_full includes the bootstrap state for slow critic
@@ -692,6 +697,12 @@ def train(args):
                     BG = B
 
                 # --- Imagined rollout ---
+                # Build denormalization function if valnorm is active
+                _denorm_fn = None
+                if valnorm is not None:
+                    _voff_r, _vscl_r = valnorm.stats()
+                    _denorm_fn = lambda v: v * _vscl_r + _voff_r
+
                 rollout = imagine_rollout(
                     dyn, policy, reward_head, value_head,
                     z_context=z1.detach(),
@@ -705,6 +716,7 @@ def train(args):
                     action_dim=action_dim,
                     ctx_renoise_idx=args.ctx_renoise_idx,
                     use_amp=use_amp,
+                    denorm_value=_denorm_fn,
                 )
 
                 # --- Compute TD(λ) returns ---
@@ -712,6 +724,9 @@ def train(args):
                     # Use slow critic for bootstrap if available (Dreamer v3)
                     if slow_value is not None:
                         slow_vals = slow_value.predict(rollout["h_states_full"])  # (B, H+1)
+                        if valnorm is not None:
+                            _voff, _vscl = valnorm.stats()
+                            slow_vals = slow_vals * _vscl + _voff
                         lambda_returns = compute_lambda_returns(
                             rollout["rewards"],
                             slow_vals,
@@ -728,7 +743,12 @@ def train(args):
 
                 # --- Shared setup for all policy loss variants ---
                 with torch.no_grad():
-                    tar_vals = slow_value.predict(rollout["h_states_full"])[:, :-1] if slow_value else rollout["values"][:, :-1]
+                    if slow_value is not None:
+                        tar_vals = slow_value.predict(rollout["h_states_full"])[:, :-1]
+                        if valnorm is not None:
+                            tar_vals = tar_vals * _vscl + _voff
+                    else:
+                        tar_vals = rollout["values"][:, :-1]
                     advantages = (lambda_returns - tar_vals).detach()
                     # Always mean-center advantages to prevent REINFORCE from
                     # degenerating to "push all log probs up" when V underestimates.
