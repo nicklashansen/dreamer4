@@ -5,7 +5,7 @@ Loads a Phase 2 checkpoint, runs the full pipeline (encode → dynamics → rewa
 on real data, and reports correlation + per-bucket accuracy.
 
 Usage:
-    python eval_reward.py /data/dreamer4/runs/walker-walk-v7/phase2/step_0000500.pt
+    python eval_reward.py /path/to/phase2_checkpoint.pt
 """
 import argparse
 import math
@@ -25,9 +25,9 @@ def main():
     p.add_argument("phase2_ckpt", type=str)
     p.add_argument("--tokenizer_ckpt", type=str, default="../logs/tokenizer.pt")
     p.add_argument("--data_dirs", nargs="+", default=[
-        "/public/dreamer4/expert", "/public/dreamer4/mixed-small", "/public/dreamer4/mixed-large"])
+        "data/expert", "data/mixed-small", "data/mixed-large"])
     p.add_argument("--frame_dirs", nargs="+", default=[
-        "/public/dreamer4/expert-shards", "/public/dreamer4/mixed-small-shards", "/public/dreamer4/mixed-large-shards"])
+        "data/expert-shards", "data/mixed-small-shards", "data/mixed-large-shards"])
     p.add_argument("--tasks", nargs="+", default=["walker-walk"])
     p.add_argument("--tasks_json", type=str, default="../tasks.json")
     p.add_argument("--device", type=str, default="cuda:0")

@@ -14,8 +14,8 @@ Usage:
     python dreamer4/train_imagination.py \
         --tokenizer_ckpt logs/tokenizer.pt \
         --phase2_ckpt logs/agent_ckpts/final.pt \
-        --data_dirs /public/dreamer4/expert \
-        --frame_dirs /public/dreamer4/expert-shards
+        --data_dirs data/expert \
+        --frame_dirs data/expert-shards
 """
 import os
 import time
@@ -1064,14 +1064,14 @@ if __name__ == "__main__":
 
     # Data
     p.add_argument("--data_dirs", type=str, nargs="+", default=[   # paths to raw data
-        "/public/dreamer4/expert",
-        "/public/dreamer4/mixed-small",
-        "/public/dreamer4/mixed-large",
+        "data/expert",
+        "data/mixed-small",
+        "data/mixed-large",
     ])
     p.add_argument("--frame_dirs", type=str, nargs="+", default=[  # paths to preprocessed frames
-        "/public/dreamer4/expert-shards",
-        "/public/dreamer4/mixed-small-shards",
-        "/public/dreamer4/mixed-large-shards",
+        "data/expert-shards",
+        "data/mixed-small-shards",
+        "data/mixed-large-shards",
     ])
     p.add_argument("--tasks_json", type=str, default="./tasks.json")
     p.add_argument("--context_len", type=int, default=16)
@@ -1205,7 +1205,7 @@ if __name__ == "__main__":
     # wandb
     p.add_argument("--wandb_project", type=str, default="Dreamer 4 Continuous Control")
     p.add_argument("--wandb_run_name", type=str, default="default")
-    p.add_argument("--wandb_entity", type=str, default="eqforcing")
+    p.add_argument("--wandb_entity", type=str, default=None)
 
     # Checkpointing
     p.add_argument("--ckpt_dir", type=str, default="./logs/imagination_ckpts")

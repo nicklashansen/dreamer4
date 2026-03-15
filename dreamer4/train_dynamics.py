@@ -971,14 +971,14 @@ if __name__ == "__main__":
 
     # data (if using multiple datasets, make sure they align in order)
     p.add_argument("--data_dirs", type=str, nargs="+", default=[   # paths to raw data
-        "/public/dreamer4/expert",
-        "/public/dreamer4/mixed-small",
-        "/public/dreamer4/mixed-large",
+        "data/expert",
+        "data/mixed-small",
+        "data/mixed-large",
     ])
     p.add_argument("--frame_dirs", type=str, nargs="+", default=[  # paths to preprocessed frames
-        "/public/dreamer4/expert-shards",
-        "/public/dreamer4/mixed-small-shards",
-        "/public/dreamer4/mixed-large-shards",
+        "data/expert-shards",
+        "data/mixed-small-shards",
+        "data/mixed-large-shards",
     ])
     p.add_argument("--tasks_json", type=str, default="../tasks.json")  # task metadata
     p.add_argument("--seq_len", type=int, default=32)
@@ -1045,7 +1045,7 @@ if __name__ == "__main__":
     # wandb
     p.add_argument("--wandb_project", type=str, default="Dreamer 4 Continuous Control")
     p.add_argument("--wandb_run_name", type=str, default="default")
-    p.add_argument("--wandb_entity", type=str, default="eqforcing")
+    p.add_argument("--wandb_entity", type=str, default=None)
 
     # ckpt
     p.add_argument("--ckpt_dir", type=str, default="./logs/dynamics_ckpts")
