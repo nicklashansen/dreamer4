@@ -35,7 +35,6 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from task_set import TASK_SET
 from wm_dataset import WMDataset, collate_batch
-from agent_diagnostics import AgentDiagnosticsHook, DiagnosticsConfig
 from model import (
     Encoder, Decoder, Tokenizer, Dynamics, TaskEmbedder,
     temporal_patchify, pack_bottleneck_to_spatial,
@@ -268,7 +267,7 @@ def bc_loss(
     else:
         expert_mask = torch.ones(B, device=h_t.device)
 
-    expert_n = expert_mask.sum().clamp(min=1e-6)              # number of expert samples
+    expert_n = expert_mask.sum().clamp(min=1)              # number of expert samples
 
     total_nll = torch.tensor(0.0, device=h_t.device)
     count = 0
@@ -297,7 +296,7 @@ def bc_loss(
     loss = total_nll / max(count, 1)
     # std over expert rows only (non-expert rows would inflate/deflate the metric)
     exp_w = expert_mask[:, None, None, None].expand_as(std)
-    expert_std = (std * exp_w).sum() / exp_w.sum().clamp(min=1e-6)
+    expert_std = (std * exp_w).sum() / exp_w.sum().clamp(min=1)
     aux = {
         "bc_nll": loss.detach(),
         "bc_mean_std": expert_std.detach(),
@@ -774,7 +773,6 @@ def train(args):
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     seed_everything(args.seed + rank)
-
     dataset = WMDataset(
         data_dir=args.data_dirs,
         frames_dir=args.frame_dirs,
@@ -916,29 +914,6 @@ def train(args):
     opt = torch.optim.AdamW(all_params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
     use_amp = torch.cuda.is_available()
     scaler = GradScaler(device="cuda", enabled=use_amp)
-
-    # --- Diagnostics hook (optional) ---
-    diag_path = args.diag_jsonl
-    if (not diag_path) and args.diag_enable:
-        diag_path = str(Path(args.ckpt_dir) / "diagnostics" / "phase2_diagnostics.jsonl")
-    snapshot_dir = args.diag_snapshot_dir
-    if (not snapshot_dir) and args.diag_enable:
-        snapshot_dir = str(Path(args.ckpt_dir) / "diagnostics" / "spike_samples")
-    diag_hook = AgentDiagnosticsHook(
-        DiagnosticsConfig(
-            enabled=bool(args.diag_enable),
-            every=int(args.diag_every),
-            topk=int(args.diag_topk),
-            bc_spike_mult=float(args.diag_bc_spike_mult),
-            bc_abs_threshold=float(args.diag_bc_abs_threshold),
-            ema_decay=float(args.diag_ema_decay),
-            jsonl_path=diag_path,
-            snapshot_dir=snapshot_dir,
-            snapshot_topk=int(args.diag_snapshot_topk),
-        ),
-        task_names=list(dataset.tasks),
-        source_names=[source_id_to_name[i] for i in range(len(dataset.sources))],
-    )
 
     # Initialize wandb
     if is_rank0():
@@ -1224,36 +1199,6 @@ def train(args):
                         ctx_renoise_idx=args.ctx_renoise_idx,
                     )
 
-                if is_rank0():
-                    elapsed = (time.time() - t0) / 3600.0
-                    spike_msg = diag_hook.maybe_record(
-                        step=step,
-                        bc_loss=float(bc_l.item()),
-                        dyn_loss=float(dyn_loss.item()),
-                        rew_loss=float(rw_l.item()),
-                        total_loss=float(total_loss.item()),
-                        flow_mse=float(dyn_aux["flow_mse"].item()),
-                        boot_mse=float(dyn_aux["bootstrap_mse"].item()),
-                        h_t=h_pooled.detach(),
-                        policy=policy,
-                        actions=act.detach(),
-                        act_mask=mask.detach(),
-                        rewards=rew.detach(),
-                        obs_u8=obs_u8.detach(),
-                        mtp_length=int(args.mtp_length),
-                        task_ids=task_id.detach(),
-                        source_ids=source_id.detach(),
-                        segment_idx=segment_idx.detach(),
-                        window_start=window_start.detach(),
-                        episode_id=episode_id.detach(),
-                        sample_idx=sample_idx.detach(),
-                        reward_pred_mean=float(rw_aux["reward_pred_mean"].item()),
-                        reward_target_mean=float(rw_aux["reward_target_mean"].item()),
-                        elapsed_hours=float(elapsed),
-                    )
-                    if spike_msg is not None:
-                        print(spike_msg)
-
                 # --- Checkpointing ---
                 if is_rank0() and args.save_every > 0 and step > 0 and (step % args.save_every == 0):
                     save_ckpt(
@@ -1288,7 +1233,6 @@ def train(args):
     if ddp:
         dist.barrier()
         dist.destroy_process_group()
-    diag_hook.close()
 
 
 if __name__ == "__main__":
@@ -1363,7 +1307,7 @@ if __name__ == "__main__":
                    help="Number of autoregressive prediction steps.")
 
     # data filter
-    p.add_argument("--mask_expert_diffusion_loss", action="store_true") # specified as true in github/pretrained
+    p.add_argument("--mask_expert_diffusion_loss", action="store_true") # claimed in Dreamer 4 paper
     
     # optim
     p.add_argument("--lr", type=float, default=1e-4, help="LR for heads + task embedder")
@@ -1420,25 +1364,5 @@ if __name__ == "__main__":
     # misc
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--compile", action="store_true")
-
-    # Diagnostics
-    p.add_argument("--diag_enable", action="store_true",
-                   help="Enable detailed per-batch diagnostics for BC outlier analysis.")
-    p.add_argument("--diag_every", type=int, default=25,
-                   help="Emit detailed diagnostics every N steps.")
-    p.add_argument("--diag_topk", type=int, default=3,
-                   help="Top-K outlier samples (by BC NLL) to log per diagnostic event.")
-    p.add_argument("--diag_bc_spike_mult", type=float, default=8.0,
-                   help="Spike threshold multiplier over BC EMA.")
-    p.add_argument("--diag_bc_abs_threshold", type=float, default=100.0,
-                   help="Absolute BC threshold for spike detection.")
-    p.add_argument("--diag_ema_decay", type=float, default=0.99,
-                   help="EMA decay used for BC spike thresholding.")
-    p.add_argument("--diag_jsonl", type=str, default="",
-                   help="Path to JSONL diagnostics file (default: <ckpt_dir>/diagnostics/phase2_diagnostics.jsonl).")
-    p.add_argument("--diag_snapshot_dir", type=str, default="",
-                   help="Directory to dump full top-K spike samples as .pt files.")
-    p.add_argument("--diag_snapshot_topk", type=int, default=3,
-                   help="Top-K outlier samples to dump per spike event.")
 
     train(p.parse_args())

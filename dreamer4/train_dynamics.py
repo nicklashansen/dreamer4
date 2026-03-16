@@ -229,7 +229,7 @@ def dynamics_pretrain_loss(
     flow_per = (z1_hat_emp.float() - z1[:B_emp].float()).pow(2).mean(dim=(2, 3))  # (B_emp,T)
     if diffusion_mask is not None:
         nm_emp = diffusion_mask[:B_emp].to(device).float()  # (B_emp,)
-        n_ne_emp = nm_emp.sum().clamp(min=1e-6)
+        n_ne_emp = nm_emp.sum().clamp(min=1)
         loss_emp = (flow_per * w_emp * nm_emp[:, None]).sum() / (n_ne_emp * T)
     else:
         loss_emp = (flow_per * w_emp).mean()
@@ -257,7 +257,7 @@ def dynamics_pretrain_loss(
         boot_per = (1.0 - sigma_self).pow(2) * (vhat_sigma - vbar_target).pow(2).mean(dim=(2, 3))  # (B_self,T)
         if diffusion_mask is not None:
             nm_self = diffusion_mask[B_emp:].to(device).float()  # (B_self,)
-            n_ne_self = nm_self.sum().clamp(min=1e-6)
+            n_ne_self = nm_self.sum().clamp(min=1)
             loss_self = (boot_per * w_self * nm_self[:, None]).sum() / (n_ne_self * T)
             boot_mse = (boot_per * nm_self[:, None]).sum() / (n_ne_self * T)
         else:
@@ -1012,7 +1012,7 @@ if __name__ == "__main__":
 
     # actions and data filters
     p.add_argument("--use_actions", action="store_true") # specified as true in github/pretrained
-    p.add_argument("--mask_expert_diffusion_loss", action="store_true") # specified as true in github/pretrained
+    p.add_argument("--mask_expert_diffusion_loss", action="store_true") # claimed in Dreamer 4 paper
 
     # optim
     p.add_argument("--lr", type=float, default=1e-4)
