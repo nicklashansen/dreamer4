@@ -309,13 +309,12 @@ class BlockCausalLayer(nn.Module):
 
         self.norm3 = RMSNorm(d_model)
         self.mlp = MLP(d_model, mlp_ratio=mlp_ratio, dropout=dropout)
-        self.drop3 = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.drop1(self.space(self.norm1(x)))
         if self.do_time:
             x = x + self.drop2(self.time(self.norm2(x)))
-        x = x + self.drop3(self.mlp(self.norm3(x)))
+        x = x + self.mlp(self.norm3(x))
         return x
 
 
