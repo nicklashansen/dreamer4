@@ -72,6 +72,7 @@ def save_ckpt(path: Path, *, step: int, epoch: int, dyn_model, opt, scaler, args
         "opt": opt.state_dict(),
         "scaler": scaler.state_dict() if scaler is not None else None,
         "args": vars(args),
+        "scale_pos_embeds": args.scale_pos_embeds,
     }
     tmp = path.with_suffix(".tmp")
     torch.save(obj, tmp)
@@ -122,6 +123,7 @@ def load_frozen_tokenizer_from_pt_ckpt(
         latents_only_time=bool(tok_args.get("latents_only_time", True)),
         mae_p_min=0.0,
         mae_p_max=0.0,
+        scale_pos_embeds=bool(tok_args.get("scale_pos_embeds", True)),
     )
     dec = Decoder(
         d_bottleneck=int(tok_args.get("d_bottleneck", 32)),
@@ -135,6 +137,7 @@ def load_frozen_tokenizer_from_pt_ckpt(
         mlp_ratio=float(tok_args.get("mlp_ratio", 4.0)),
         time_every=int(tok_args.get("time_every", 1)),
         latents_only_time=bool(tok_args.get("latents_only_time", True)),
+        scale_pos_embeds=bool(tok_args.get("scale_pos_embeds", True)),
     )
 
     tok = Tokenizer(enc, dec)
@@ -662,6 +665,7 @@ def train(args):
         mlp_ratio=args.mlp_ratio,
         time_every=args.time_every,
         space_mode=args.space_mode,
+        scale_pos_embeds=args.scale_pos_embeds,
     ).to(device)
 
     if is_rank0():
@@ -920,6 +924,10 @@ if __name__ == "__main__":
     p.add_argument("--W", type=int, default=None)
     p.add_argument("--C", type=int, default=None)
     p.add_argument("--patch", type=int, default=None)
+
+    # Better performance without scale_pos_embeds (set to False)
+    # Set to True by default for backwards compatibility. Details here: https://github.com/nicklashansen/dreamer4/pull/4
+    p.add_argument("--scale_pos_embeds", action="store_true")
 
     # dynamics arch
     p.add_argument("--d_model_dyn", type=int, default=512)
