@@ -436,18 +436,23 @@ class WMDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         task_idx, start = self._lookup(int(idx))
 
-        obs = self._get_frames(task_idx, start, self.T + 1)  # (T+1,3,H,W) uint8
+        obs = self._get_frames(task_idx, start, self.T + 1)
 
         # Transition from obs[t] -> obs[t+1] uses action/reward stored at index (t+1)
-        act = self.act[task_idx][start + 1 : start + 1 + self.T]   # (T,16) float32 (padded)
-        rew = self.rew[task_idx][start + 1 : start + 1 + self.T]   # (T,) float32
+        act = self.act[task_idx][start + 1 : start + 1 + self.T]
+        rew = self.rew[task_idx][start + 1 : start + 1 + self.T]
 
-        Ad = int(self._act_dims[task_idx])
+        meta_ad = int(self._act_dims[task_idx])
+        real_ad = int(act.shape[-1])
+        Ad = min(meta_ad, real_ad, self.A)
+
         act_padded = torch.zeros(self.T, self.A, dtype=torch.float32)
         if Ad > 0:
             act_padded[:, :Ad] = torch.nan_to_num(act[:, :Ad], nan=0.0)
 
-        act_mask = self._act_mask_1d[task_idx][None, :].expand(self.T, self.A).contiguous()
+        act_mask = torch.zeros(self.T, self.A, dtype=torch.float32)
+        if Ad > 0:
+            act_mask[:, :Ad] = 1.0
 
         return {
             "obs": obs,
