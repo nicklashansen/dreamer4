@@ -208,12 +208,13 @@
       <div class="buttons">
         <button id="btnPause">Pause/Resume (<span class="kbd">Space</span>)</button>
         <button id="btnReset">Reset (<span class="kbd">R</span>)</button>
+        <button id="btnAutopilot" style="display:none">Autopilot (<span class="kbd">A</span>)</button>
         <button id="btnDisconnect">Disconnect (<span class="kbd">Q</span>/<span class="kbd">Esc</span>)</button>
       </div>
 
       <div class="hint">
-        <div><span class="kbd">←</span>/<span class="kbd">→</span> select action dim</div>
-        <div><span class="kbd">↑</span>/<span class="kbd">↓</span> set selected dim to +1 / -1 while held</div>
+        <div><span class="kbd">←</span>/<span class="kbd">→</span> select action dim &nbsp; <span class="kbd">↑</span>/<span class="kbd">↓</span> set selected dim to +1 / -1 while held</div>
+        <div id="hintAutopilot" style="display:none"><span class="kbd">A</span> toggle autopilot (policy-driven actions)</div>
         <div style="margin-top:8px;">Click this page first if keys don’t register.</div>
       </div>
     </div>
@@ -228,7 +229,15 @@
 
   const btnPause = document.getElementById("btnPause");
   const btnReset = document.getElementById("btnReset");
+  const btnAutopilot = document.getElementById("btnAutopilot");
   const btnDisconnect = document.getElementById("btnDisconnect");
+  const hintAutopilot = document.getElementById("hintAutopilot");
+
+  const HAS_POLICY = __HAS_POLICY__;
+  if (HAS_POLICY) {
+    btnAutopilot.style.display = "";
+    hintAutopilot.style.display = "";
+  }
 
   const proto = (location.protocol === "https:") ? "wss" : "ws";
   const wsUrl = `${proto}://${location.host}/ws`;
@@ -317,7 +326,7 @@
   const down = new Set();
   function keyName(e) { return (e.key === " ") ? "Space" : e.key; }
   function shouldCapture(k) {
-    return ["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Space","r","R","q","Q","Escape"].includes(k);
+    return ["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Space","r","R","a","A","q","Q","Escape"].includes(k);
   }
 
   window.addEventListener("keydown", (e) => {
@@ -344,6 +353,7 @@
 
   btnPause.onclick = () => send({type:"toggle_pause"});
   btnReset.onclick = () => send({type:"reset"});
+  btnAutopilot.onclick = () => send({type:"toggle_autopilot"});
   btnDisconnect.onclick = () => send({type:"disconnect"});
 
   connect();

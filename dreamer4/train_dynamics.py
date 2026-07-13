@@ -187,6 +187,7 @@ def dynamics_pretrain_loss(
     step: int,
     bootstrap_start: int,
     agent_tokens: Optional[torch.Tensor] = None,
+    diffusion_mask: Optional[torch.Tensor] = None,  # (B,) float: 1=non-expert, 0=expert; None=no masking is one interpretation
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     device = z1.device
     B, T = z1.shape[:2]
@@ -224,12 +225,17 @@ def dynamics_pretrain_loss(
     w_self = 0.9 * sigma_self + 0.1
 
     # Main forward
-    z1_hat_full, _ = dynamics(actions, step_idx_full, sigma_idx_full, z_tilde_full, act_mask=act_mask_full, agent_tokens=agent_tokens)
+    z1_hat_full, h_t_full = dynamics(actions, step_idx_full, sigma_idx_full, z_tilde_full, act_mask=act_mask_full, agent_tokens=agent_tokens)
     z1_hat_emp = z1_hat_full[:B_emp]
     z1_hat_self = z1_hat_full[B_emp:]
 
     flow_per = (z1_hat_emp.float() - z1[:B_emp].float()).pow(2).mean(dim=(2, 3))  # (B_emp,T)
-    loss_emp = (flow_per * w_emp).mean()
+    if diffusion_mask is not None:
+        nm_emp = diffusion_mask[:B_emp].to(device).float()  # (B_emp,)
+        n_ne_emp = nm_emp.sum().clamp(min=1)
+        loss_emp = (flow_per * w_emp * nm_emp[:, None]).sum() / (n_ne_emp * T)
+    else:
+        loss_emp = (flow_per * w_emp).mean()
 
     boot_mse = torch.zeros((), device=device, dtype=torch.float32)
     loss_self = torch.zeros((), device=device, dtype=torch.float32)
@@ -252,11 +258,21 @@ def dynamics_pretrain_loss(
         vbar_target = ((b_prime + b_doubleprime) / 2.0).detach()
 
         boot_per = (1.0 - sigma_self).pow(2) * (vhat_sigma - vbar_target).pow(2).mean(dim=(2, 3))  # (B_self,T)
-        loss_self = (boot_per * w_self).mean()
-        boot_mse = boot_per.mean()
+        if diffusion_mask is not None:
+            nm_self = diffusion_mask[B_emp:].to(device).float()  # (B_self,)
+            n_ne_self = nm_self.sum().clamp(min=1)
+            loss_self = (boot_per * w_self * nm_self[:, None]).sum() / (n_ne_self * T)
+            boot_mse = (boot_per * nm_self[:, None]).sum() / (n_ne_self * T)
+        else:
+            loss_self = (boot_per * w_self).mean()
+            boot_mse = boot_per.mean()
 
     # Combine losses
     loss = ((loss_emp * (B - B_self)) + (loss_self * B_self)) / B
+
+    # h_t from noisy forward pass — used by BC/reward heads in Phase 2
+    # Pool over agent dim: (B, T, n_agent, d_model) → (B, T, d_model)
+    h_t_pooled = h_t_full.mean(dim=2) if h_t_full is not None else None
 
     aux = {
         "flow_mse": flow_per.mean().detach(),
@@ -264,6 +280,7 @@ def dynamics_pretrain_loss(
         "loss_emp": loss_emp.detach(),
         "loss_self": loss_self.detach(),
         "sigma_mean": sigma_full.mean().detach(),
+        "h_t": h_t_pooled,
     }
     return loss, aux
 
@@ -311,6 +328,7 @@ def sample_one_timestep_packed(
     sched: Dict[str, Any],
     actions: Optional[torch.Tensor] = None,     # (B,T,A) aligned to frames or None
     act_mask: Optional[torch.Tensor] = None,    # (B,T,A) or (A,) or None
+    ctx_renoise_idx: int = -1,                  # -1 disables; [0, k_max-1] enables context renoise
 ) -> torch.Tensor:
     device = past_packed.device
     dtype = past_packed.dtype
@@ -332,6 +350,21 @@ def sample_one_timestep_packed(
     step_idxs_full[:, -1] = e  # only the sampled timestep uses the shortcut step
 
     signal_idxs_full = torch.full((B, t + 1), k_max - 1, device=device, dtype=torch.long)
+    ctx_idx = int(ctx_renoise_idx)
+    if ctx_idx < -1 or ctx_idx > int(k_max) - 1:
+        raise ValueError(f"ctx_renoise_idx must be in [-1, {k_max - 1}], got {ctx_renoise_idx}")
+    use_ctx_renoise = ctx_idx >= 0
+    # context may be a temporary noisy tensor
+    if use_ctx_renoise:
+        sigma_ctx = float(ctx_idx) / float(k_max)
+        eps_ctx = torch.randn_like(past_packed)
+        past_noised = ((1.0 - sigma_ctx) * eps_ctx + sigma_ctx * past_packed).to(dtype)
+        signal_idxs_full[:, :-1] = ctx_idx
+        ctx_mask = torch.zeros((B, t + 1, 1, 1), device=device, dtype=torch.bool)
+        ctx_mask[:, :t] = True
+    else:
+        past_noised = past_packed
+        ctx_mask = None
 
     # broadcast (A,) -> (B,T,A) if needed (only if actions are present)
     if act_mask is not None and act_mask.dim() == 1:
@@ -342,7 +375,12 @@ def sample_one_timestep_packed(
         sig_i = int(tau_idx[i])
 
         signal_idxs_full[:, -1] = sig_i
-        packed_seq = torch.cat([past_packed, z], dim=1)  # (B,t+1,...)
+        packed_clean = torch.cat([past_packed, z], dim=1)  # (B,t+1,...)
+        if use_ctx_renoise:
+            packed_noised = torch.cat([past_noised, z], dim=1)
+            packed_seq = torch.where(ctx_mask, packed_noised, packed_clean)
+        else:
+            packed_seq = packed_clean
 
         actions_in = None if actions is None else actions[:, : t + 1]
         actmask_in = None if act_mask is None else act_mask[:, : t + 1]
@@ -375,6 +413,7 @@ def sample_autoregressive_packed_sequence(
     sched: Dict[str, Any],
     actions: Optional[torch.Tensor] = None,     # (B,T,A) or None
     act_mask: Optional[torch.Tensor] = None,    # (B,T,A) or (A,) or None
+    ctx_renoise_idx: int = -1,
 ) -> torch.Tensor:
     B, T = z_gt_packed.shape[:2]
     L = min(T, ctx_length + horizon)
@@ -392,6 +431,7 @@ def sample_autoregressive_packed_sequence(
             sched=sched,
             actions=actions,
             act_mask=act_mask,
+            ctx_renoise_idx=ctx_renoise_idx,
         )
         outs.append(z_next)
 
@@ -474,6 +514,7 @@ def run_dynamics_eval(
     sched: Dict[str, Any],
     max_items: int,
     step: int,
+    ctx_renoise_idx: int = -1,
 ):
     dyn_was_training = dyn.training
     dyn.eval()
@@ -503,6 +544,7 @@ def run_dynamics_eval(
         sched=sched,
         actions=actions_eval,
         act_mask=act_mask_eval,
+        ctx_renoise_idx=ctx_renoise_idx,
     )
 
     pred_frames = decode_packed_to_frames(
@@ -608,6 +650,8 @@ def train(args):
             worker_init_fn=worker_init_fn,
             collate_fn=collate_batch,
         )
+        source_id_to_name = {i: os.path.basename(dd) for i, (dd, _) in enumerate(dataset.sources)}
+        expert_src_ids = {i for i, name in source_id_to_name.items() if name == "expert"}
     else:
         dataset = ShardedFrameDataset(
             outdirs=args.frame_dirs,
@@ -626,6 +670,8 @@ def train(args):
             persistent_workers=(args.num_workers > 0),
             worker_init_fn=worker_init_fn,
         )
+        source_id_to_name = {}
+        expert_src_ids = set()
 
     # Load frozen tokenizer
     tok_override = {}
@@ -723,9 +769,10 @@ def train(args):
                     break
 
                 if args.use_actions:
-                    obs_u8 = batch["obs"].to(device, non_blocking=True)          # (B,T+1,3,H,W) uint8
-                    act    = batch["act"].to(device, non_blocking=True)          # (B,T,16) float
-                    mask   = batch["act_mask"].to(device, non_blocking=True)     # (B,T,16) float (optional but good)
+                    obs_u8    = batch["obs"].to(device, non_blocking=True)       # (B,T+1,3,H,W) uint8
+                    act       = batch["act"].to(device, non_blocking=True)       # (B,T,16) float
+                    mask      = batch["act_mask"].to(device, non_blocking=True)  # (B,T,16) float
+                    source_id = batch["source_id"].to(device, non_blocking=True) # (B,) long
 
                     act = act.clamp(-1, 1) * mask
 
@@ -739,6 +786,7 @@ def train(args):
                     frames = batch.to(device, non_blocking=True)                 # (B,T,3,H,W)
                     actions = None
                     act_mask = None
+                    source_id = None
 
                 # Safeguard: convert to [0, 1] if dataset returns uint8
                 if frames.dtype == torch.uint8:
@@ -757,6 +805,25 @@ def train(args):
                 B_self = int(round(args.self_fraction * B))
                 B_self = max(0, min(B - 1, B_self))
 
+                # Non-expert mask: 1.0 for non-expert rows, 0.0 for expert rows
+                # When source_id is unavailable (ShardedFrameDataset), all rows are treated as non-expert
+                if source_id is not None and expert_src_ids:
+                    expert_mask = torch.zeros(B, device=device)
+                    for _sid in expert_src_ids:
+                        expert_mask = expert_mask + (source_id == _sid).float()
+                    expert_mask = expert_mask.clamp(max=1.0)
+                    nonexpert_mask = 1.0 - expert_mask
+                else:
+                    nonexpert_mask = None
+
+                # Masking expert rows from the diffusion loss avoids optimistic generations:
+                # a world model trained on expert data learns to hallucinate expert-quality
+                # transitions, causing imagination rollouts to be unrealistically good. 
+                if args.mask_expert_diffusion_loss:
+                    diffusion_mask = nonexpert_mask  # may be None if no expert sources present
+                else:
+                    diffusion_mask = None  # no masking: all rows contribute equally
+
                 with autocast(device_type="cuda", enabled=use_amp):
                     loss, aux = dynamics_pretrain_loss(
                         dyn.module if hasattr(dyn, "module") else dyn,
@@ -768,6 +835,7 @@ def train(args):
                         step=step,
                         bootstrap_start=args.bootstrap_start,
                         agent_tokens=None,
+                        diffusion_mask=diffusion_mask,
                     )
 
                 if not torch.isfinite(loss):
@@ -823,6 +891,7 @@ def train(args):
                         sched=sched,
                         max_items=args.eval_max_items,
                         step=step,
+                        ctx_renoise_idx=args.ctx_renoise_idx,
                     )
 
                 # Logging
@@ -841,6 +910,7 @@ def train(args):
                                 step=step,
                                 bootstrap_start=args.bootstrap_start,
                                 agent_tokens=None,
+                                diffusion_mask=diffusion_mask,
                             )
                             perm = torch.randperm(actions.shape[0], device=actions.device)
                             loss_shuffled, _ = dynamics_pretrain_loss(
@@ -853,6 +923,7 @@ def train(args):
                                 step=step,
                                 bootstrap_start=args.bootstrap_start,
                                 agent_tokens=None,
+                                diffusion_mask=diffusion_mask,
                             )
                         action_shuffle_loss_ratio = loss_shuffled / loss
                     else:
@@ -884,7 +955,7 @@ def train(args):
                     )
 
                 # Checkpointing
-                if is_rank0() and args.save_every > 0 and (step % args.save_every == 0) and do_step:
+                if is_rank0() and args.save_every > 0 and (step % args.save_every == 0):
                     ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
                     save_ckpt(ckpt_path, step=step, epoch=epoch, dyn_model=dyn, opt=opt, scaler=scaler, args=args)
                     latest = ckpt_dir / "latest.pt"
@@ -904,18 +975,18 @@ if __name__ == "__main__":
 
     # data (if using multiple datasets, make sure they align in order)
     p.add_argument("--data_dirs", type=str, nargs="+", default=[   # paths to raw data
-        "/<path>/expert",
-        "/<path>/mixed-small",
-        "/<path>/mixed-large",
+        "data/expert",
+        "data/mixed-small",
+        "data/mixed-large",
     ])
     p.add_argument("--frame_dirs", type=str, nargs="+", default=[  # paths to preprocessed frames
-        "/<path>/expert-shards",
-        "/<path>/mixed-small-shards",
-        "/<path>/mixed-large-shards",
+        "data/expert-shards",
+        "data/mixed-small-shards",
+        "data/mixed-large-shards",
     ])
     p.add_argument("--tasks_json", type=str, default="../tasks.json")  # task metadata
     p.add_argument("--seq_len", type=int, default=32)
-    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--batch_size", type=int, default=24)
 
     # tokenizer restore
@@ -947,8 +1018,9 @@ if __name__ == "__main__":
     p.add_argument("--bootstrap_start", type=int, default=5_000)
     p.add_argument("--self_fraction", type=float, default=0.25)
 
-    # actions
-    p.add_argument("--use_actions", action="store_true")
+    # actions and data filters
+    p.add_argument("--use_actions", action="store_true") # specified as true in github/pretrained
+    p.add_argument("--mask_expert_diffusion_loss", action="store_true") # claimed in Dreamer 4 paper
 
     # optim
     p.add_argument("--lr", type=float, default=1e-4)
@@ -965,18 +1037,27 @@ if __name__ == "__main__":
     p.add_argument("--eval_horizon", type=int, default=16)
     p.add_argument("--eval_schedule", type=str, default="shortcut", choices=["finest", "shortcut"])
     p.add_argument("--eval_d", type=float, default=0.25)
+    p.add_argument(
+        "--ctx_renoise_idx",
+        type=int,
+        default=-1,
+        help=(
+            "Context renoise signal index for inference-only eval rollouts. "
+            "-1=disable; 0=full noise; k_max-1=slightest noising (noise fraction 1/k_max)."
+        ),
+    )
 
     # logging
     p.add_argument("--log_every", type=int, default=200)
 
     # wandb
-    p.add_argument("--wandb_project", type=str, default="dreamer4-dynamics")
+    p.add_argument("--wandb_project", type=str, default="Dreamer 4 Continuous Control")
     p.add_argument("--wandb_run_name", type=str, default="default")
     p.add_argument("--wandb_entity", type=str, default=None)
 
     # ckpt
     p.add_argument("--ckpt_dir", type=str, default="./logs/dynamics_ckpts")
-    p.add_argument("--save_every", type=int, default=10_000)
+    p.add_argument("--save_every", type=int, default=0)
     p.add_argument("--resume", type=str, default=None)
 
     # misc
