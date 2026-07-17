@@ -322,7 +322,6 @@ def load_dynamics_from_ckpt(
     k_max = int(a.get("k_max", 8))
     n_register = int(a.get("n_register", 4))
     n_agent = int(a.get("n_agent", 0))
-    space_mode = str(a.get("space_mode", a.get("agent_space_mode", "wm_agent_isolated")))
     scale_pos_embeds = bool(a.get("scale_pos_embeds", True))
 
     assert n_latents % packing_factor == 0
@@ -342,7 +341,6 @@ def load_dynamics_from_ckpt(
         dropout=dropout,
         mlp_ratio=mlp_ratio,
         time_every=time_every,
-        space_mode=space_mode,
         scale_pos_embeds=scale_pos_embeds,
     ).to(device)
     dyn.load_state_dict(_get_state_dict(ckpt), strict=True)

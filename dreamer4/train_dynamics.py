@@ -664,7 +664,6 @@ def train(args):
         dropout=args.dropout,
         mlp_ratio=args.mlp_ratio,
         time_every=args.time_every,
-        space_mode=args.space_mode,
         scale_pos_embeds=args.scale_pos_embeds,
     ).to(device)
 
@@ -940,7 +939,6 @@ if __name__ == "__main__":
     p.add_argument("--packing_factor", type=int, default=2)
     p.add_argument("--n_register", type=int, default=4)
     p.add_argument("--n_agent", type=int, default=1)
-    p.add_argument("--space_mode", type=str, default="wm_agent_isolated", choices=["wm_agent_isolated", "wm_agent"])
 
     # shortcut / schedule
     p.add_argument("--k_max", type=int, default=8)

@@ -231,10 +231,6 @@ class SpaceSelfAttentionModality(nn.Module):
             allow_nonlat_q = same_mod | is_k_lat
             return torch.where(is_q_lat, allow_lat_q, allow_nonlat_q)
 
-        if self.mode == "wm_agent":
-            # full mixing across modalities
-            return torch.ones((S, S), dtype=torch.bool, device=device)
-
         if self.mode == "wm_agent_isolated":
             # non-agent tokens: can attend to everything EXCEPT agent tokens
             # agent tokens: attend only to agent tokens (keeps them inert in pretrain)
@@ -590,7 +586,6 @@ class Dynamics(nn.Module):
         dropout: float = 0.0,
         mlp_ratio: float = 4.0,
         time_every: int = 4,
-        space_mode: str = "wm_agent_isolated",  # or "wm_agent"
         scale_pos_embeds: bool = True,
     ):
         super().__init__()
@@ -636,7 +631,7 @@ class Dynamics(nn.Module):
             depth=int(depth),
             n_latents=0,
             modality_ids=modality_ids,
-            space_mode=space_mode,
+            space_mode="wm_agent_isolated",
             dropout=float(dropout),
             mlp_ratio=float(mlp_ratio),
             time_every=int(time_every),
